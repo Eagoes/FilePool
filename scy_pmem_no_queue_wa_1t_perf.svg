@@ -1,0 +1,1992 @@
+<?xml version="1.0" standalone="no"?>
+<!DOCTYPE svg PUBLIC "-//W3C//DTD SVG 1.1//EN" "http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd">
+<svg version="1.1" width="1200" height="662" onload="init(evt)" viewBox="0 0 1200 662" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink">
+<!-- Flame graph stack visualization. See https://github.com/brendangregg/FlameGraph for latest version, and http://www.brendangregg.com/flamegraphs.html for examples. -->
+<!-- NOTES:  -->
+<defs>
+	<linearGradient id="background" y1="0" y2="1" x1="0" x2="0" >
+		<stop stop-color="#eeeeee" offset="5%" />
+		<stop stop-color="#eeeeb0" offset="95%" />
+	</linearGradient>
+</defs>
+<style type="text/css">
+	text { font-family:Verdana; font-size:12px; fill:rgb(0,0,0); }
+	#search, #ignorecase { opacity:0.1; cursor:pointer; }
+	#search:hover, #search.show, #ignorecase:hover, #ignorecase.show { opacity:1; }
+	#subtitle { text-anchor:middle; font-color:rgb(160,160,160); }
+	#title { text-anchor:middle; font-size:17px}
+	#unzoom { cursor:pointer; }
+	#frames > *:hover { stroke:black; stroke-width:0.5; cursor:pointer; }
+	.hide { display:none; }
+	.parent { opacity:0.5; }
+</style>
+<script type="text/ecmascript">
+<![CDATA[
+	"use strict";
+	var details, searchbtn, unzoombtn, matchedtxt, svg, searching, currentSearchTerm, ignorecase, ignorecaseBtn;
+	function init(evt) {
+		details = document.getElementById("details").firstChild;
+		searchbtn = document.getElementById("search");
+		ignorecaseBtn = document.getElementById("ignorecase");
+		unzoombtn = document.getElementById("unzoom");
+		matchedtxt = document.getElementById("matched");
+		svg = document.getElementsByTagName("svg")[0];
+		searching = 0;
+		currentSearchTerm = null;
+	}
+
+	window.addEventListener("click", function(e) {
+		var target = find_group(e.target);
+		if (target) {
+			if (target.nodeName == "a") {
+				if (e.ctrlKey === false) return;
+				e.preventDefault();
+			}
+			if (target.classList.contains("parent")) unzoom();
+			zoom(target);
+		}
+		else if (e.target.id == "unzoom") unzoom();
+		else if (e.target.id == "search") search_prompt();
+		else if (e.target.id == "ignorecase") toggle_ignorecase();
+	}, false)
+
+	// mouse-over for info
+	// show
+	window.addEventListener("mouseover", function(e) {
+		var target = find_group(e.target);
+		if (target) details.nodeValue = "Function: " + g_to_text(target);
+	}, false)
+
+	// clear
+	window.addEventListener("mouseout", function(e) {
+		var target = find_group(e.target);
+		if (target) details.nodeValue = ' ';
+	}, false)
+
+	// ctrl-F for search
+	window.addEventListener("keydown",function (e) {
+		if (e.keyCode === 114 || (e.ctrlKey && e.keyCode === 70)) {
+			e.preventDefault();
+			search_prompt();
+		}
+	}, false)
+
+	// ctrl-I to toggle case-sensitive search
+	window.addEventListener("keydown",function (e) {
+		if (e.ctrlKey && e.keyCode === 73) {
+			e.preventDefault();
+			toggle_ignorecase();
+		}
+	}, false)
+
+	// functions
+	function find_child(node, selector) {
+		var children = node.querySelectorAll(selector);
+		if (children.length) return children[0];
+		return;
+	}
+	function find_group(node) {
+		var parent = node.parentElement;
+		if (!parent) return;
+		if (parent.id == "frames") return node;
+		return find_group(parent);
+	}
+	function orig_save(e, attr, val) {
+		if (e.attributes["_orig_" + attr] != undefined) return;
+		if (e.attributes[attr] == undefined) return;
+		if (val == undefined) val = e.attributes[attr].value;
+		e.setAttribute("_orig_" + attr, val);
+	}
+	function orig_load(e, attr) {
+		if (e.attributes["_orig_"+attr] == undefined) return;
+		e.attributes[attr].value = e.attributes["_orig_" + attr].value;
+		e.removeAttribute("_orig_"+attr);
+	}
+	function g_to_text(e) {
+		var text = find_child(e, "title").firstChild.nodeValue;
+		return (text)
+	}
+	function g_to_func(e) {
+		var func = g_to_text(e);
+		// if there's any manipulation we want to do to the function
+		// name before it's searched, do it here before returning.
+		return (func);
+	}
+	function update_text(e) {
+		var r = find_child(e, "rect");
+		var t = find_child(e, "text");
+		var w = parseFloat(r.attributes.width.value) -3;
+		var txt = find_child(e, "title").textContent.replace(/\([^(]*\)$/,"");
+		t.attributes.x.value = parseFloat(r.attributes.x.value) + 3;
+
+		// Smaller than this size won't fit anything
+		if (w < 2 * 12 * 0.59) {
+			t.textContent = "";
+			return;
+		}
+
+		t.textContent = txt;
+		// Fit in full text width
+		if (/^ *$/.test(txt) || t.getSubStringLength(0, txt.length) < w)
+			return;
+
+		for (var x = txt.length - 2; x > 0; x--) {
+			if (t.getSubStringLength(0, x + 2) <= w) {
+				t.textContent = txt.substring(0, x) + "..";
+				return;
+			}
+		}
+		t.textContent = "";
+	}
+
+	// zoom
+	function zoom_reset(e) {
+		if (e.attributes != undefined) {
+			orig_load(e, "x");
+			orig_load(e, "width");
+		}
+		if (e.childNodes == undefined) return;
+		for (var i = 0, c = e.childNodes; i < c.length; i++) {
+			zoom_reset(c[i]);
+		}
+	}
+	function zoom_child(e, x, ratio) {
+		if (e.attributes != undefined) {
+			if (e.attributes.x != undefined) {
+				orig_save(e, "x");
+				e.attributes.x.value = (parseFloat(e.attributes.x.value) - x - 10) * ratio + 10;
+				if (e.tagName == "text")
+					e.attributes.x.value = find_child(e.parentNode, "rect[x]").attributes.x.value + 3;
+			}
+			if (e.attributes.width != undefined) {
+				orig_save(e, "width");
+				e.attributes.width.value = parseFloat(e.attributes.width.value) * ratio;
+			}
+		}
+
+		if (e.childNodes == undefined) return;
+		for (var i = 0, c = e.childNodes; i < c.length; i++) {
+			zoom_child(c[i], x - 10, ratio);
+		}
+	}
+	function zoom_parent(e) {
+		if (e.attributes) {
+			if (e.attributes.x != undefined) {
+				orig_save(e, "x");
+				e.attributes.x.value = 10;
+			}
+			if (e.attributes.width != undefined) {
+				orig_save(e, "width");
+				e.attributes.width.value = parseInt(svg.width.baseVal.value) - (10 * 2);
+			}
+		}
+		if (e.childNodes == undefined) return;
+		for (var i = 0, c = e.childNodes; i < c.length; i++) {
+			zoom_parent(c[i]);
+		}
+	}
+	function zoom(node) {
+		var attr = find_child(node, "rect").attributes;
+		var width = parseFloat(attr.width.value);
+		var xmin = parseFloat(attr.x.value);
+		var xmax = parseFloat(xmin + width);
+		var ymin = parseFloat(attr.y.value);
+		var ratio = (svg.width.baseVal.value - 2 * 10) / width;
+
+		// XXX: Workaround for JavaScript float issues (fix me)
+		var fudge = 0.0001;
+
+		unzoombtn.classList.remove("hide");
+
+		var el = document.getElementById("frames").children;
+		for (var i = 0; i < el.length; i++) {
+			var e = el[i];
+			var a = find_child(e, "rect").attributes;
+			var ex = parseFloat(a.x.value);
+			var ew = parseFloat(a.width.value);
+			var upstack;
+			// Is it an ancestor
+			if (0 == 0) {
+				upstack = parseFloat(a.y.value) > ymin;
+			} else {
+				upstack = parseFloat(a.y.value) < ymin;
+			}
+			if (upstack) {
+				// Direct ancestor
+				if (ex <= xmin && (ex+ew+fudge) >= xmax) {
+					e.classList.add("parent");
+					zoom_parent(e);
+					update_text(e);
+				}
+				// not in current path
+				else
+					e.classList.add("hide");
+			}
+			// Children maybe
+			else {
+				// no common path
+				if (ex < xmin || ex + fudge >= xmax) {
+					e.classList.add("hide");
+				}
+				else {
+					zoom_child(e, xmin, ratio);
+					update_text(e);
+				}
+			}
+		}
+		search();
+	}
+	function unzoom() {
+		unzoombtn.classList.add("hide");
+		var el = document.getElementById("frames").children;
+		for(var i = 0; i < el.length; i++) {
+			el[i].classList.remove("parent");
+			el[i].classList.remove("hide");
+			zoom_reset(el[i]);
+			update_text(el[i]);
+		}
+		search();
+	}
+
+	// search
+	function toggle_ignorecase() {
+		ignorecase = !ignorecase;
+		if (ignorecase) {
+			ignorecaseBtn.classList.add("show");
+		} else {
+			ignorecaseBtn.classList.remove("show");
+		}
+		reset_search();
+		search();
+	}
+	function reset_search() {
+		var el = document.querySelectorAll("#frames rect");
+		for (var i = 0; i < el.length; i++) {
+			orig_load(el[i], "fill")
+		}
+	}
+	function search_prompt() {
+		if (!searching) {
+			var term = prompt("Enter a search term (regexp " +
+			    "allowed, eg: ^ext4_)"
+			    + (ignorecase ? ", ignoring case" : "")
+			    + "\nPress Ctrl-i to toggle case sensitivity", "");
+			if (term != null) {
+				currentSearchTerm = term;
+				search();
+			}
+		} else {
+			reset_search();
+			searching = 0;
+			currentSearchTerm = null;
+			searchbtn.classList.remove("show");
+			searchbtn.firstChild.nodeValue = "Search"
+			matchedtxt.classList.add("hide");
+			matchedtxt.firstChild.nodeValue = ""
+		}
+	}
+	function search(term) {
+		if (currentSearchTerm === null) return;
+		var term = currentSearchTerm;
+
+		var re = new RegExp(term, ignorecase ? 'i' : '');
+		var el = document.getElementById("frames").children;
+		var matches = new Object();
+		var maxwidth = 0;
+		for (var i = 0; i < el.length; i++) {
+			var e = el[i];
+			var func = g_to_func(e);
+			var rect = find_child(e, "rect");
+			if (func == null || rect == null)
+				continue;
+
+			// Save max width. Only works as we have a root frame
+			var w = parseFloat(rect.attributes.width.value);
+			if (w > maxwidth)
+				maxwidth = w;
+
+			if (func.match(re)) {
+				// highlight
+				var x = parseFloat(rect.attributes.x.value);
+				orig_save(rect, "fill");
+				rect.attributes.fill.value = "rgb(230,0,230)";
+
+				// remember matches
+				if (matches[x] == undefined) {
+					matches[x] = w;
+				} else {
+					if (w > matches[x]) {
+						// overwrite with parent
+						matches[x] = w;
+					}
+				}
+				searching = 1;
+			}
+		}
+		if (!searching)
+			return;
+
+		searchbtn.classList.add("show");
+		searchbtn.firstChild.nodeValue = "Reset Search";
+
+		// calculate percent matched, excluding vertical overlap
+		var count = 0;
+		var lastx = -1;
+		var lastw = 0;
+		var keys = Array();
+		for (k in matches) {
+			if (matches.hasOwnProperty(k))
+				keys.push(k);
+		}
+		// sort the matched frames by their x location
+		// ascending, then width descending
+		keys.sort(function(a, b){
+			return a - b;
+		});
+		// Step through frames saving only the biggest bottom-up frames
+		// thanks to the sort order. This relies on the tree property
+		// where children are always smaller than their parents.
+		var fudge = 0.0001;	// JavaScript floating point
+		for (var k in keys) {
+			var x = parseFloat(keys[k]);
+			var w = matches[keys[k]];
+			if (x >= lastx + lastw - fudge) {
+				count += w;
+				lastx = x;
+				lastw = w;
+			}
+		}
+		// display matched percent
+		matchedtxt.classList.remove("hide");
+		var pct = 100 * count / maxwidth;
+		if (pct != 100) pct = pct.toFixed(1)
+		matchedtxt.firstChild.nodeValue = "Matched: " + pct + "%";
+	}
+]]>
+</script>
+<rect x="0.0" y="0" width="1200.0" height="662.0" fill="url(#background)"  />
+<text id="title" x="600.00" y="24" >Flame Graph</text>
+<text id="details" x="10.00" y="645" > </text>
+<text id="unzoom" x="10.00" y="24" class="hide">Reset Zoom</text>
+<text id="search" x="1090.00" y="24" >Search</text>
+<text id="ignorecase" x="1174.00" y="24" >ic</text>
+<text id="matched" x="1090.00" y="645" > </text>
+<g id="frames">
+<g >
+<title>pmem::obj::transaction::run&lt;&gt; (3 samples, 0.90%)</title><rect x="233.9" y="245" width="10.7" height="15.0" fill="rgb(224,133,36)" rx="2" ry="2" />
+<text  x="236.92" y="255.5" ></text>
+</g>
+<g >
+<title>std::_Destroy&lt;std::pair&lt;std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;, std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt; &gt; &gt; (1 samples, 0.30%)</title><rect x="617.8" y="229" width="3.5" height="15.0" fill="rgb(215,79,10)" rx="2" ry="2" />
+<text  x="620.77" y="239.5" ></text>
+</g>
+<g >
+<title>pmem::obj::persistent_ptr_base::persistent_ptr_base (4 samples, 1.20%)</title><rect x="511.1" y="197" width="14.3" height="15.0" fill="rgb(251,16,41)" rx="2" ry="2" />
+<text  x="514.14" y="207.5" ></text>
+</g>
+<g >
+<title>std::function&lt;int  (13 samples, 3.92%)</title><rect x="539.6" y="229" width="46.2" height="15.0" fill="rgb(223,90,5)" rx="2" ry="2" />
+<text  x="542.58" y="239.5" >std:..</text>
+</g>
+<g >
+<title>pmemobj_direct_inline (1 samples, 0.30%)</title><rect x="507.6" y="213" width="3.5" height="15.0" fill="rgb(211,187,34)" rx="2" ry="2" />
+<text  x="510.59" y="223.5" ></text>
+</g>
+<g >
+<title>std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;::_M_mutate (1 samples, 0.30%)</title><rect x="457.8" y="245" width="3.6" height="15.0" fill="rgb(223,64,2)" rx="2" ry="2" />
+<text  x="460.83" y="255.5" ></text>
+</g>
+<g >
+<title>__tls_get_addr (1 samples, 0.30%)</title><rect x="955.4" y="565" width="3.6" height="15.0" fill="rgb(235,220,37)" rx="2" ry="2" />
+<text  x="958.42" y="575.5" ></text>
+</g>
+<g >
+<title>std::_Vector_base&lt;std::pair&lt;std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;, std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt; &gt;, std::allocator&lt;std::pair&lt;std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;, std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt; &gt; &gt; &gt;::~_Vector_base (1 samples, 0.30%)</title><rect x="621.3" y="277" width="3.6" height="15.0" fill="rgb(248,152,54)" rx="2" ry="2" />
+<text  x="624.33" y="287.5" ></text>
+</g>
+<g >
+<title>std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;::_M_mutate (1 samples, 0.30%)</title><rect x="923.4" y="229" width="3.6" height="15.0" fill="rgb(233,34,1)" rx="2" ry="2" />
+<text  x="926.43" y="239.5" ></text>
+</g>
+<g >
+<title>pmem::obj::transaction::run&lt;&gt; (7 samples, 2.11%)</title><rect x="209.0" y="245" width="24.9" height="15.0" fill="rgb(213,84,8)" rx="2" ry="2" />
+<text  x="212.04" y="255.5" >p..</text>
+</g>
+<g >
+<title>scythedb::NVMSkipList::Node::PersistentKey (19 samples, 5.72%)</title><rect x="728.0" y="197" width="67.5" height="15.0" fill="rgb(229,39,29)" rx="2" ry="2" />
+<text  x="730.95" y="207.5" >scythed..</text>
+</g>
+<g >
+<title>std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;::basic_string (1 samples, 0.30%)</title><rect x="607.1" y="293" width="3.6" height="15.0" fill="rgb(214,75,53)" rx="2" ry="2" />
+<text  x="610.11" y="303.5" ></text>
+</g>
+<g >
+<title>pmem::obj::persistent_ptr&lt;scythedb::InternalNode&gt;::operator (1 samples, 0.30%)</title><rect x="233.9" y="165" width="3.6" height="15.0" fill="rgb(231,28,44)" rx="2" ry="2" />
+<text  x="236.92" y="175.5" ></text>
+</g>
+<g >
+<title>std::generate_canonical&lt;double, 53ul, std::linear_congruential_engine&lt;unsigned long, 16807ul, 0ul, 2147483647ul&gt; &gt; (1 samples, 0.30%)</title><rect x="941.2" y="181" width="3.6" height="15.0" fill="rgb(210,184,30)" rx="2" ry="2" />
+<text  x="944.20" y="191.5" ></text>
+</g>
+<g >
+<title>ycsbc::CoreWorkload::NextTransactionKey[abi:cxx11] (4 samples, 1.20%)</title><rect x="624.9" y="293" width="14.2" height="15.0" fill="rgb(213,198,14)" rx="2" ry="2" />
+<text  x="627.88" y="303.5" ></text>
+</g>
+<g >
+<title>std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;::assign (4 samples, 1.20%)</title><rect x="592.9" y="277" width="14.2" height="15.0" fill="rgb(235,207,1)" rx="2" ry="2" />
+<text  x="595.89" y="287.5" ></text>
+</g>
+<g >
+<title>std::function&lt;void  (2 samples, 0.60%)</title><rect x="223.3" y="101" width="7.1" height="15.0" fill="rgb(213,21,11)" rx="2" ry="2" />
+<text  x="226.25" y="111.5" ></text>
+</g>
+<g >
+<title>scythedb::NVMArena::AllocateAligned (1 samples, 0.30%)</title><rect x="887.9" y="213" width="3.5" height="15.0" fill="rgb(252,109,28)" rx="2" ry="2" />
+<text  x="890.89" y="223.5" ></text>
+</g>
+<g >
+<title>std::addressof&lt;char const&gt; (1 samples, 0.30%)</title><rect x="909.2" y="117" width="3.6" height="15.0" fill="rgb(213,135,43)" rx="2" ry="2" />
+<text  x="912.22" y="127.5" ></text>
+</g>
+<g >
+<title>scythedb::InternalKeyComparator::Compare (6 samples, 1.81%)</title><rect x="845.2" y="133" width="21.4" height="15.0" fill="rgb(205,134,54)" rx="2" ry="2" />
+<text  x="848.24" y="143.5" >s..</text>
+</g>
+<g >
+<title>operation_add_buffer (2 samples, 0.60%)</title><rect x="1158.0" y="581" width="7.1" height="15.0" fill="rgb(211,199,20)" rx="2" ry="2" />
+<text  x="1161.01" y="591.5" ></text>
+</g>
+<g >
+<title>std::__uninitialized_copy&lt;false&gt;::__uninit_copy&lt;std::move_iterator&lt;std::pair&lt;std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;, std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt; &gt;*&gt;, std::pair&lt;std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;, std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt; &gt;*&gt; (1 samples, 0.30%)</title><rect x="919.9" y="197" width="3.5" height="15.0" fill="rgb(242,220,10)" rx="2" ry="2" />
+<text  x="922.88" y="207.5" ></text>
+</g>
+<g >
+<title>__gnu_cxx::new_allocator&lt;std::pair&lt;std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;, std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt; &gt; &gt;::construct&lt;std::pair&lt;std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;, std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt; &gt;, std::pair&lt;std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;, std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt; &gt; const&amp;&gt; (1 samples, 0.30%)</title><rect x="486.3" y="245" width="3.5" height="15.0" fill="rgb(239,24,9)" rx="2" ry="2" />
+<text  x="489.27" y="255.5" ></text>
+</g>
+<g >
+<title>pmem::obj::persistent_ptr&lt;char&gt;::get (1 samples, 0.30%)</title><rect x="255.2" y="197" width="3.6" height="15.0" fill="rgb(250,108,18)" rx="2" ry="2" />
+<text  x="258.24" y="207.5" ></text>
+</g>
+<g >
+<title>scythedb::Slice::Slice (1 samples, 0.30%)</title><rect x="390.3" y="133" width="3.6" height="15.0" fill="rgb(253,118,35)" rx="2" ry="2" />
+<text  x="393.30" y="143.5" ></text>
+</g>
+<g >
+<title>malloc (1 samples, 0.30%)</title><rect x="632.0" y="165" width="3.5" height="15.0" fill="rgb(245,166,21)" rx="2" ry="2" />
+<text  x="634.99" y="175.5" ></text>
+</g>
+<g >
+<title>scythedb::NVMBlock::Get (31 samples, 9.34%)</title><rect x="496.9" y="293" width="110.2" height="15.0" fill="rgb(208,66,14)" rx="2" ry="2" />
+<text  x="499.93" y="303.5" >scythedb::NVM..</text>
+</g>
+<g >
+<title>__memcmp_avx2_movbe (1 samples, 0.30%)</title><rect x="401.0" y="117" width="3.5" height="15.0" fill="rgb(220,145,44)" rx="2" ry="2" />
+<text  x="403.96" y="127.5" ></text>
+</g>
+<g >
+<title>pmem::obj::transaction::run&lt;&gt; (1 samples, 0.30%)</title><rect x="887.9" y="197" width="3.5" height="15.0" fill="rgb(240,87,30)" rx="2" ry="2" />
+<text  x="890.89" y="207.5" ></text>
+</g>
+<g >
+<title>std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;::_M_data (1 samples, 0.30%)</title><rect x="461.4" y="261" width="3.5" height="15.0" fill="rgb(224,202,22)" rx="2" ry="2" />
+<text  x="464.39" y="271.5" ></text>
+</g>
+<g >
+<title>scythedb::ExtractUserKey (2 samples, 0.60%)</title><rect x="859.5" y="117" width="7.1" height="15.0" fill="rgb(232,32,54)" rx="2" ry="2" />
+<text  x="862.46" y="127.5" ></text>
+</g>
+<g >
+<title>operation_init (2 samples, 0.60%)</title><rect x="148.6" y="549" width="7.1" height="15.0" fill="rgb(253,101,25)" rx="2" ry="2" />
+<text  x="151.61" y="559.5" ></text>
+</g>
+<g >
+<title>std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;::~basic_string (1 samples, 0.30%)</title><rect x="930.5" y="261" width="3.6" height="15.0" fill="rgb(225,147,9)" rx="2" ry="2" />
+<text  x="933.54" y="271.5" ></text>
+</g>
+<g >
+<title>pmem::obj::p&lt;unsigned long&gt;::operator unsigned long (2 samples, 0.60%)</title><rect x="209.0" y="181" width="7.1" height="15.0" fill="rgb(209,121,19)" rx="2" ry="2" />
+<text  x="212.04" y="191.5" ></text>
+</g>
+<g >
+<title>std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;::_M_is_local (1 samples, 0.30%)</title><rect x="898.6" y="197" width="3.5" height="15.0" fill="rgb(230,115,14)" rx="2" ry="2" />
+<text  x="901.55" y="207.5" ></text>
+</g>
+<g >
+<title>pmemobj_direct_inline (1 samples, 0.30%)</title><rect x="536.0" y="181" width="3.6" height="15.0" fill="rgb(250,204,10)" rx="2" ry="2" />
+<text  x="539.02" y="191.5" ></text>
+</g>
+<g >
+<title>std::char_traits&lt;char&gt;::assign (1 samples, 0.30%)</title><rect x="475.6" y="245" width="3.6" height="15.0" fill="rgb(238,101,34)" rx="2" ry="2" />
+<text  x="478.60" y="255.5" ></text>
+</g>
+<g >
+<title>std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;::_M_set_length (1 samples, 0.30%)</title><rect x="607.1" y="277" width="3.6" height="15.0" fill="rgb(213,30,9)" rx="2" ry="2" />
+<text  x="610.11" y="287.5" ></text>
+</g>
+<g >
+<title>std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;::_M_construct&lt;char*&gt; (1 samples, 0.30%)</title><rect x="927.0" y="245" width="3.5" height="15.0" fill="rgb(226,28,49)" rx="2" ry="2" />
+<text  x="929.99" y="255.5" ></text>
+</g>
+<g >
+<title>scythedb::(anonymous namespace)::BytewiseComparatorImpl::Compare (2 samples, 0.60%)</title><rect x="848.8" y="117" width="7.1" height="15.0" fill="rgb(253,107,26)" rx="2" ry="2" />
+<text  x="851.80" y="127.5" ></text>
+</g>
+<g >
+<title>palloc_reservation_create (2 samples, 0.60%)</title><rect x="1019.4" y="565" width="7.1" height="15.0" fill="rgb(253,160,2)" rx="2" ry="2" />
+<text  x="1022.40" y="575.5" ></text>
+</g>
+<g >
+<title>scythedb::ExtractUserKey (3 samples, 0.90%)</title><rect x="568.0" y="149" width="10.7" height="15.0" fill="rgb(205,82,27)" rx="2" ry="2" />
+<text  x="571.01" y="159.5" ></text>
+</g>
+<g >
+<title>std::pair&lt;std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;, std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt; &gt;::pair&lt;std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;&amp;, true&gt; (1 samples, 0.30%)</title><rect x="610.7" y="277" width="3.5" height="15.0" fill="rgb(239,29,0)" rx="2" ry="2" />
+<text  x="613.66" y="287.5" ></text>
+</g>
+<g >
+<title>scythedb::NVMBlock::KeyComparator::Compare (16 samples, 4.82%)</title><rect x="809.7" y="149" width="56.9" height="15.0" fill="rgb(237,16,9)" rx="2" ry="2" />
+<text  x="812.70" y="159.5" >scythe..</text>
+</g>
+<g >
+<title>pmem::obj::persistent_ptr&lt;char&gt;::persistent_ptr (8 samples, 2.41%)</title><rect x="262.3" y="197" width="28.5" height="15.0" fill="rgb(205,55,10)" rx="2" ry="2" />
+<text  x="265.35" y="207.5" >pm..</text>
+</g>
+<g >
+<title>scythedb::NVMArena::AllocateAligned (1 samples, 0.30%)</title><rect x="447.2" y="165" width="3.5" height="15.0" fill="rgb(238,7,5)" rx="2" ry="2" />
+<text  x="450.17" y="175.5" ></text>
+</g>
+<g >
+<title>scythedb::DecodeFixed64 (1 samples, 0.30%)</title><rect x="855.9" y="117" width="3.6" height="15.0" fill="rgb(210,98,7)" rx="2" ry="2" />
+<text  x="858.90" y="127.5" ></text>
+</g>
+<g >
+<title>std::_Function_base::~_Function_base (1 samples, 0.30%)</title><rect x="230.4" y="101" width="3.5" height="15.0" fill="rgb(217,113,19)" rx="2" ry="2" />
+<text  x="233.36" y="111.5" ></text>
+</g>
+<g >
+<title>ycsbc::CoreWorkload::read_all_fields (1 samples, 0.30%)</title><rect x="639.1" y="293" width="3.6" height="15.0" fill="rgb(248,110,24)" rx="2" ry="2" />
+<text  x="642.10" y="303.5" ></text>
+</g>
+<g >
+<title>scythedb::NVMSkipList::Node::SetPersistNext (1 samples, 0.30%)</title><rect x="674.6" y="165" width="3.6" height="15.0" fill="rgb(236,208,16)" rx="2" ry="2" />
+<text  x="677.64" y="175.5" ></text>
+</g>
+<g >
+<title>msort_with_tmp.part.0 (4 samples, 1.20%)</title><rect x="1143.8" y="581" width="14.2" height="15.0" fill="rgb(211,205,13)" rx="2" ry="2" />
+<text  x="1146.80" y="591.5" ></text>
+</g>
+<g >
+<title>scythedb::NVMSkipList::NewNode (2 samples, 0.60%)</title><rect x="884.3" y="229" width="7.1" height="15.0" fill="rgb(254,148,12)" rx="2" ry="2" />
+<text  x="887.34" y="239.5" ></text>
+</g>
+<g >
+<title>operation_process (1 samples, 0.30%)</title><rect x="1015.8" y="565" width="3.6" height="15.0" fill="rgb(210,151,29)" rx="2" ry="2" />
+<text  x="1018.84" y="575.5" ></text>
+</g>
+<g >
+<title>std::operator==&lt;std::pair&lt;std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;, std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt; &gt;*&gt; (1 samples, 0.30%)</title><rect x="919.9" y="165" width="3.5" height="15.0" fill="rgb(221,121,49)" rx="2" ry="2" />
+<text  x="922.88" y="175.5" ></text>
+</g>
+<g >
+<title>pmem::obj::transaction::run&lt;&gt; (5 samples, 1.51%)</title><rect x="656.9" y="229" width="17.7" height="15.0" fill="rgb(220,192,3)" rx="2" ry="2" />
+<text  x="659.87" y="239.5" ></text>
+</g>
+<g >
+<title>pmemobj_direct_inline (1 samples, 0.30%)</title><rect x="791.9" y="149" width="3.6" height="15.0" fill="rgb(212,61,25)" rx="2" ry="2" />
+<text  x="794.93" y="159.5" ></text>
+</g>
+<g >
+<title>scythedb::Slice::data (1 samples, 0.30%)</title><rect x="571.6" y="133" width="3.5" height="15.0" fill="rgb(253,53,4)" rx="2" ry="2" />
+<text  x="574.57" y="143.5" ></text>
+</g>
+<g >
+<title>std::_Function_base::_Function_base (1 samples, 0.30%)</title><rect x="450.7" y="229" width="3.6" height="15.0" fill="rgb(222,123,37)" rx="2" ry="2" />
+<text  x="453.72" y="239.5" ></text>
+</g>
+<g >
+<title>std::vector&lt;std::pair&lt;std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;, std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt; &gt;, std::allocator&lt;std::pair&lt;std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;, std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt; &gt; &gt; &gt;::~vector (1 samples, 0.30%)</title><rect x="909.2" y="293" width="3.6" height="15.0" fill="rgb(223,105,10)" rx="2" ry="2" />
+<text  x="912.22" y="303.5" ></text>
+</g>
+<g >
+<title>pmem::obj::vector&lt;std::pair&lt;pmem::obj::persistent_ptr&lt;char&gt;, unsigned long&gt; &gt;::push_back (1 samples, 0.30%)</title><rect x="671.1" y="133" width="3.5" height="15.0" fill="rgb(239,182,51)" rx="2" ry="2" />
+<text  x="674.08" y="143.5" ></text>
+</g>
+<g >
+<title>__tls_get_addr (1 samples, 0.30%)</title><rect x="1118.9" y="581" width="3.6" height="15.0" fill="rgb(222,79,11)" rx="2" ry="2" />
+<text  x="1121.92" y="591.5" ></text>
+</g>
+<g >
+<title>ycsbc::CoreWorkload::BuildUpdate (3 samples, 0.90%)</title><rect x="912.8" y="293" width="10.6" height="15.0" fill="rgb(252,72,48)" rx="2" ry="2" />
+<text  x="915.77" y="303.5" ></text>
+</g>
+<g >
+<title>std::_Any_data::_M_access&lt;scythedb::NVMBlock::NVMBlock (1 samples, 0.30%)</title><rect x="866.6" y="165" width="3.5" height="15.0" fill="rgb(224,9,45)" rx="2" ry="2" />
+<text  x="869.57" y="175.5" ></text>
+</g>
+<g >
+<title>memblock_rebuild_state (1 samples, 0.30%)</title><rect x="973.2" y="565" width="3.5" height="15.0" fill="rgb(247,174,4)" rx="2" ry="2" />
+<text  x="976.19" y="575.5" ></text>
+</g>
+<g >
+<title>pmem::obj::persistent_ptr&lt;char&gt;::operator char* (1 samples, 0.30%)</title><rect x="724.4" y="197" width="3.6" height="15.0" fill="rgb(230,61,12)" rx="2" ry="2" />
+<text  x="727.40" y="207.5" ></text>
+</g>
+<g >
+<title>std::call_once&lt;void  (215 samples, 64.76%)</title><rect x="191.3" y="533" width="764.1" height="15.0" fill="rgb(205,184,28)" rx="2" ry="2" />
+<text  x="194.27" y="543.5" >std::call_once&lt;void </text>
+</g>
+<g >
+<title>std::function&lt;void  (1 samples, 0.30%)</title><rect x="447.2" y="197" width="3.5" height="15.0" fill="rgb(212,29,53)" rx="2" ry="2" />
+<text  x="450.17" y="207.5" ></text>
+</g>
+<g >
+<title>scythedb::NVMBlock::Add (75 samples, 22.59%)</title><rect x="642.7" y="293" width="266.5" height="15.0" fill="rgb(249,131,16)" rx="2" ry="2" />
+<text  x="645.65" y="303.5" >scythedb::NVMBlock::Add</text>
+</g>
+<g >
+<title>std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;::_M_create (1 samples, 0.30%)</title><rect x="610.7" y="197" width="3.5" height="15.0" fill="rgb(241,132,50)" rx="2" ry="2" />
+<text  x="613.66" y="207.5" ></text>
+</g>
+<g >
+<title>pmem::obj::standard_alloc_policy&lt;char&gt;::allocate (1 samples, 0.30%)</title><rect x="447.2" y="117" width="3.5" height="15.0" fill="rgb(243,114,6)" rx="2" ry="2" />
+<text  x="450.17" y="127.5" ></text>
+</g>
+<g >
+<title>scythedb::ExtractUserKey (3 samples, 0.90%)</title><rect x="408.1" y="133" width="10.6" height="15.0" fill="rgb(221,25,15)" rx="2" ry="2" />
+<text  x="411.07" y="143.5" ></text>
+</g>
+<g >
+<title>realloc (1 samples, 0.30%)</title><rect x="1097.6" y="565" width="3.5" height="15.0" fill="rgb(230,213,2)" rx="2" ry="2" />
+<text  x="1100.59" y="575.5" ></text>
+</g>
+<g >
+<title>ycsbc::CoreWorkload::BuildKeyName[abi:cxx11] (1 samples, 0.30%)</title><rect x="489.8" y="293" width="3.6" height="15.0" fill="rgb(226,193,41)" rx="2" ry="2" />
+<text  x="492.82" y="303.5" ></text>
+</g>
+<g >
+<title>std::_Destroy&lt;std::pair&lt;std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;, std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt; &gt;*, std::pair&lt;std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;, std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt; &gt; &gt; (1 samples, 0.30%)</title><rect x="909.2" y="277" width="3.6" height="15.0" fill="rgb(218,134,13)" rx="2" ry="2" />
+<text  x="912.22" y="287.5" ></text>
+</g>
+<g >
+<title>pmem::obj::transaction::run&lt;&gt; (1 samples, 0.30%)</title><rect x="447.2" y="213" width="3.5" height="15.0" fill="rgb(216,148,12)" rx="2" ry="2" />
+<text  x="450.17" y="223.5" ></text>
+</g>
+<g >
+<title>std::_Function_handler&lt;int  (13 samples, 3.92%)</title><rect x="539.6" y="213" width="46.2" height="15.0" fill="rgb(224,211,31)" rx="2" ry="2" />
+<text  x="542.58" y="223.5" >std:..</text>
+</g>
+<g >
+<title>std::addressof&lt;char&gt; (1 samples, 0.30%)</title><rect x="493.4" y="245" width="3.5" height="15.0" fill="rgb(221,140,3)" rx="2" ry="2" />
+<text  x="496.37" y="255.5" ></text>
+</g>
+<g >
+<title>pmem::obj::persistent_ptr_base::persistent_ptr_base (5 samples, 1.51%)</title><rect x="728.0" y="165" width="17.7" height="15.0" fill="rgb(241,59,8)" rx="2" ry="2" />
+<text  x="730.95" y="175.5" ></text>
+</g>
+<g >
+<title>std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;::_M_construct_aux&lt;char*&gt; (1 samples, 0.30%)</title><rect x="632.0" y="229" width="3.5" height="15.0" fill="rgb(248,148,28)" rx="2" ry="2" />
+<text  x="634.99" y="239.5" ></text>
+</g>
+<g >
+<title>scythedb::NVMSkipList::Insert (62 samples, 18.67%)</title><rect x="233.9" y="261" width="220.4" height="15.0" fill="rgb(235,30,52)" rx="2" ry="2" />
+<text  x="236.92" y="271.5" >scythedb::NVMSkipList::Insert</text>
+</g>
+<g >
+<title>std::function&lt;void  (1 samples, 0.30%)</title><rect x="450.7" y="245" width="3.6" height="15.0" fill="rgb(220,202,30)" rx="2" ry="2" />
+<text  x="453.72" y="255.5" ></text>
+</g>
+<g >
+<title>std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;::basic_string (1 samples, 0.30%)</title><rect x="927.0" y="261" width="3.5" height="15.0" fill="rgb(219,157,52)" rx="2" ry="2" />
+<text  x="929.99" y="271.5" ></text>
+</g>
+<g >
+<title>std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;::_M_construct&lt;char*&gt; (1 samples, 0.30%)</title><rect x="632.0" y="245" width="3.5" height="15.0" fill="rgb(214,189,37)" rx="2" ry="2" />
+<text  x="634.99" y="255.5" ></text>
+</g>
+<g >
+<title>pmem::obj::persistent_ptr&lt;char&gt;::get (1 samples, 0.30%)</title><rect x="504.0" y="213" width="3.6" height="15.0" fill="rgb(250,5,41)" rx="2" ry="2" />
+<text  x="507.04" y="223.5" ></text>
+</g>
+<g >
+<title>pmem::obj::persistent_ptr&lt;scythedb::InternalNode&gt;::get (5 samples, 1.51%)</title><rect x="297.9" y="181" width="17.8" height="15.0" fill="rgb(238,58,3)" rx="2" ry="2" />
+<text  x="300.89" y="191.5" ></text>
+</g>
+<g >
+<title>pmemobj_tx_begin (1 samples, 0.30%)</title><rect x="1175.8" y="581" width="3.5" height="15.0" fill="rgb(235,152,20)" rx="2" ry="2" />
+<text  x="1178.78" y="591.5" ></text>
+</g>
+<g >
+<title>std::forward&lt;char const*&gt; (1 samples, 0.30%)</title><rect x="795.5" y="197" width="3.5" height="15.0" fill="rgb(252,28,14)" rx="2" ry="2" />
+<text  x="798.48" y="207.5" ></text>
+</g>
+<g >
+<title>std::__invoke_impl&lt;int, int  (215 samples, 64.76%)</title><rect x="191.3" y="357" width="764.1" height="15.0" fill="rgb(250,153,11)" rx="2" ry="2" />
+<text  x="194.27" y="367.5" >std::__invoke_impl&lt;int, int </text>
+</g>
+<g >
+<title>std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;::_M_local_data (1 samples, 0.30%)</title><rect x="493.4" y="277" width="3.5" height="15.0" fill="rgb(211,194,51)" rx="2" ry="2" />
+<text  x="496.37" y="287.5" ></text>
+</g>
+<g >
+<title>ycsbc::CoreWorkload::NextTransactionKey[abi:cxx11] (6 samples, 1.81%)</title><rect x="923.4" y="293" width="21.4" height="15.0" fill="rgb(245,148,42)" rx="2" ry="2" />
+<text  x="926.43" y="303.5" >y..</text>
+</g>
+<g >
+<title>std::_Function_handler&lt;void  (2 samples, 0.60%)</title><rect x="674.6" y="197" width="7.1" height="15.0" fill="rgb(245,155,34)" rx="2" ry="2" />
+<text  x="677.64" y="207.5" ></text>
+</g>
+<g >
+<title>std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;::_M_is_local (1 samples, 0.30%)</title><rect x="909.2" y="165" width="3.6" height="15.0" fill="rgb(229,64,48)" rx="2" ry="2" />
+<text  x="912.22" y="175.5" ></text>
+</g>
+<g >
+<title>std::char_traits&lt;char&gt;::copy (1 samples, 0.30%)</title><rect x="923.4" y="197" width="3.6" height="15.0" fill="rgb(237,144,45)" rx="2" ry="2" />
+<text  x="926.43" y="207.5" ></text>
+</g>
+<g >
+<title>__gthread_mutex_lock (2 samples, 0.60%)</title><rect x="944.8" y="261" width="7.1" height="15.0" fill="rgb(220,21,47)" rx="2" ry="2" />
+<text  x="947.76" y="271.5" ></text>
+</g>
+<g >
+<title>scythedb::NVMSkipList::Node::PersistentKey (15 samples, 4.52%)</title><rect x="262.3" y="213" width="53.4" height="15.0" fill="rgb(206,218,52)" rx="2" ry="2" />
+<text  x="265.35" y="223.5" >scyth..</text>
+</g>
+<g >
+<title>pmem::obj::vector&lt;std::pair&lt;pmem::obj::persistent_ptr&lt;char&gt;, unsigned long&gt; &gt;::back (1 samples, 0.30%)</title><rect x="887.9" y="69" width="3.5" height="15.0" fill="rgb(253,84,50)" rx="2" ry="2" />
+<text  x="890.89" y="79.5" ></text>
+</g>
+<g >
+<title>scythedb::NVMArena::AllocateNewChunk (2 samples, 0.60%)</title><rect x="667.5" y="149" width="7.1" height="15.0" fill="rgb(247,97,18)" rx="2" ry="2" />
+<text  x="670.53" y="159.5" ></text>
+</g>
+<g >
+<title>std::_Function_base::_Base_manager&lt;scythedb::NVMBlock::NVMBlock (1 samples, 0.30%)</title><rect x="870.1" y="165" width="3.6" height="15.0" fill="rgb(238,226,52)" rx="2" ry="2" />
+<text  x="873.12" y="175.5" ></text>
+</g>
+<g >
+<title>scythedb::Slice::data (1 samples, 0.30%)</title><rect x="578.7" y="149" width="3.5" height="15.0" fill="rgb(215,189,10)" rx="2" ry="2" />
+<text  x="581.67" y="159.5" ></text>
+</g>
+<g >
+<title>pmem::obj::persistent_ptr&lt;scythedb::InternalNode&gt;::operator (5 samples, 1.51%)</title><rect x="297.9" y="197" width="17.8" height="15.0" fill="rgb(227,145,39)" rx="2" ry="2" />
+<text  x="300.89" y="207.5" ></text>
+</g>
+<g >
+<title>std::function&lt;void  (1 samples, 0.30%)</title><rect x="454.3" y="261" width="3.5" height="15.0" fill="rgb(232,59,41)" rx="2" ry="2" />
+<text  x="457.28" y="271.5" ></text>
+</g>
+<g >
+<title>std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;::_M_data (1 samples, 0.30%)</title><rect x="628.4" y="181" width="3.6" height="15.0" fill="rgb(212,162,32)" rx="2" ry="2" />
+<text  x="631.43" y="191.5" ></text>
+</g>
+<g >
+<title>scythedb::Slice::Slice (1 samples, 0.30%)</title><rect x="415.2" y="117" width="3.5" height="15.0" fill="rgb(215,124,34)" rx="2" ry="2" />
+<text  x="418.18" y="127.5" ></text>
+</g>
+<g >
+<title>std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;::_M_append (1 samples, 0.30%)</title><rect x="912.8" y="261" width="3.5" height="15.0" fill="rgb(206,21,40)" rx="2" ry="2" />
+<text  x="915.77" y="271.5" ></text>
+</g>
+<g >
+<title>ycsbc::CoreWorkload::NextTable[abi:cxx11] (1 samples, 0.30%)</title><rect x="493.4" y="309" width="3.5" height="15.0" fill="rgb(252,213,48)" rx="2" ry="2" />
+<text  x="496.37" y="319.5" ></text>
+</g>
+<g >
+<title>scythedb::NVMSkipList::Node::SetPersistNext (3 samples, 0.90%)</title><rect x="233.9" y="181" width="10.7" height="15.0" fill="rgb(215,53,22)" rx="2" ry="2" />
+<text  x="236.92" y="191.5" ></text>
+</g>
+<g >
+<title>std::mutex::lock (2 samples, 0.60%)</title><rect x="944.8" y="277" width="7.1" height="15.0" fill="rgb(209,194,27)" rx="2" ry="2" />
+<text  x="947.76" y="287.5" ></text>
+</g>
+<g >
+<title>std::vector&lt;std::pair&lt;std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;, std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt; &gt;, std::allocator&lt;std::pair&lt;std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;, std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt; &gt; &gt; &gt;::~vector (2 samples, 0.60%)</title><rect x="617.8" y="293" width="7.1" height="15.0" fill="rgb(234,95,28)" rx="2" ry="2" />
+<text  x="620.77" y="303.5" ></text>
+</g>
+<g >
+<title>std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;::_M_data (1 samples, 0.30%)</title><rect x="486.3" y="197" width="3.5" height="15.0" fill="rgb(239,156,38)" rx="2" ry="2" />
+<text  x="489.27" y="207.5" ></text>
+</g>
+<g >
+<title>std::numeric_limits&lt;unsigned long&gt;::max (1 samples, 0.30%)</title><rect x="504.0" y="197" width="3.6" height="15.0" fill="rgb(228,182,4)" rx="2" ry="2" />
+<text  x="507.04" y="207.5" ></text>
+</g>
+<g >
+<title>std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;::_M_append (1 samples, 0.30%)</title><rect x="895.0" y="229" width="3.6" height="15.0" fill="rgb(218,149,39)" rx="2" ry="2" />
+<text  x="898.00" y="239.5" ></text>
+</g>
+<g >
+<title>pmem::obj::persistent_ptr&lt;char&gt;::operator= (1 samples, 0.30%)</title><rect x="216.1" y="181" width="3.6" height="15.0" fill="rgb(223,10,4)" rx="2" ry="2" />
+<text  x="219.14" y="191.5" ></text>
+</g>
+<g >
+<title>pmem::obj::persistent_ptr&lt;scythedb::InternalNode&gt;::operator (14 samples, 4.22%)</title><rect x="745.7" y="181" width="49.8" height="15.0" fill="rgb(216,20,29)" rx="2" ry="2" />
+<text  x="748.72" y="191.5" >pmem:..</text>
+</g>
+<g >
+<title>std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;::_M_dispose (1 samples, 0.30%)</title><rect x="635.5" y="245" width="3.6" height="15.0" fill="rgb(248,160,53)" rx="2" ry="2" />
+<text  x="638.54" y="255.5" ></text>
+</g>
+<g >
+<title>std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;::_M_construct_aux&lt;char*&gt; (1 samples, 0.30%)</title><rect x="927.0" y="229" width="3.5" height="15.0" fill="rgb(241,70,19)" rx="2" ry="2" />
+<text  x="929.99" y="239.5" ></text>
+</g>
+<g >
+<title>std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;::max_size (1 samples, 0.30%)</title><rect x="610.7" y="181" width="3.5" height="15.0" fill="rgb(207,37,41)" rx="2" ry="2" />
+<text  x="613.66" y="191.5" ></text>
+</g>
+<g >
+<title>pmemobj_direct_inline (1 samples, 0.30%)</title><rect x="205.5" y="213" width="3.5" height="15.0" fill="rgb(243,31,22)" rx="2" ry="2" />
+<text  x="208.48" y="223.5" ></text>
+</g>
+<g >
+<title>scythedb::NVMBlock::RecordPersist (70 samples, 21.08%)</title><rect x="646.2" y="261" width="248.8" height="15.0" fill="rgb(225,25,2)" rx="2" ry="2" />
+<text  x="649.20" y="271.5" >scythedb::NVMBlock::RecordPersist</text>
+</g>
+<g >
+<title>pmem::obj::operator+=&lt;unsigned long, unsigned long&gt; (1 samples, 0.30%)</title><rect x="667.5" y="133" width="3.6" height="15.0" fill="rgb(246,221,47)" rx="2" ry="2" />
+<text  x="670.53" y="143.5" ></text>
+</g>
+<g >
+<title>scythedb::NVMBlock::Add (75 samples, 22.59%)</title><rect x="642.7" y="277" width="266.5" height="15.0" fill="rgb(208,113,27)" rx="2" ry="2" />
+<text  x="645.65" y="287.5" >scythedb::NVMBlock::Add</text>
+</g>
+<g >
+<title>std::function&lt;int  (32 samples, 9.64%)</title><rect x="315.7" y="213" width="113.7" height="15.0" fill="rgb(245,131,4)" rx="2" ry="2" />
+<text  x="318.66" y="223.5" >std::function&lt;..</text>
+</g>
+<g >
+<title>pmem_flush (1 samples, 0.30%)</title><rect x="1026.5" y="565" width="3.6" height="15.0" fill="rgb(240,81,16)" rx="2" ry="2" />
+<text  x="1029.51" y="575.5" ></text>
+</g>
+<g >
+<title>pmem::obj::vector&lt;std::pair&lt;pmem::obj::persistent_ptr&lt;char&gt;, unsigned long&gt; &gt;::emplace_back&lt;std::pair&lt;pmem::obj::persistent_ptr&lt;char&gt;, unsigned long&gt; &gt; (2 samples, 0.60%)</title><rect x="223.3" y="69" width="7.1" height="15.0" fill="rgb(225,212,14)" rx="2" ry="2" />
+<text  x="226.25" y="79.5" ></text>
+</g>
+<g >
+<title>std::__invoke_impl&lt;void, void  (215 samples, 64.76%)</title><rect x="191.3" y="485" width="764.1" height="15.0" fill="rgb(213,189,33)" rx="2" ry="2" />
+<text  x="194.27" y="495.5" >std::__invoke_impl&lt;void, void </text>
+</g>
+<g >
+<title>scythedb::NVMSkipList::KeyIsAfterNode (23 samples, 6.93%)</title><rect x="504.0" y="245" width="81.8" height="15.0" fill="rgb(247,87,4)" rx="2" ry="2" />
+<text  x="507.04" y="255.5" >scythedb:..</text>
+</g>
+<g >
+<title>scythedb::GetVarint32Ptr (6 samples, 1.81%)</title><rect x="820.4" y="117" width="21.3" height="15.0" fill="rgb(247,179,10)" rx="2" ry="2" />
+<text  x="823.36" y="127.5" >s..</text>
+</g>
+<g >
+<title>scythedb::NVMBlock::NVMBlock (30 samples, 9.04%)</title><rect x="315.7" y="181" width="106.6" height="15.0" fill="rgb(246,151,13)" rx="2" ry="2" />
+<text  x="318.66" y="191.5" >scythedb::NVM..</text>
+</g>
+<g >
+<title>find_le (1 samples, 0.30%)</title><rect x="216.1" y="149" width="3.6" height="15.0" fill="rgb(249,67,4)" rx="2" ry="2" />
+<text  x="219.14" y="159.5" ></text>
+</g>
+<g >
+<title>std::_Function_handler&lt;void  (5 samples, 1.51%)</title><rect x="656.9" y="197" width="17.7" height="15.0" fill="rgb(237,182,50)" rx="2" ry="2" />
+<text  x="659.87" y="207.5" ></text>
+</g>
+<g >
+<title>std::_Function_base::_Base_manager&lt;pmem::obj::vector&lt;std::pair&lt;pmem::obj::persistent_ptr&lt;char&gt;, unsigned long&gt; &gt;::emplace_back&lt;std::pair&lt;pmem::obj::persistent_ptr&lt;char&gt;, unsigned long&gt; &gt; (1 samples, 0.30%)</title><rect x="230.4" y="85" width="3.5" height="15.0" fill="rgb(225,197,0)" rx="2" ry="2" />
+<text  x="233.36" y="95.5" ></text>
+</g>
+<g >
+<title>scythedb::NVMArena::AllocateNewChunk (4 samples, 1.20%)</title><rect x="219.7" y="165" width="14.2" height="15.0" fill="rgb(243,121,20)" rx="2" ry="2" />
+<text  x="222.70" y="175.5" ></text>
+</g>
+<g >
+<title>util_checksum_seq (1 samples, 0.30%)</title><rect x="1161.6" y="565" width="3.5" height="15.0" fill="rgb(219,175,27)" rx="2" ry="2" />
+<text  x="1164.57" y="575.5" ></text>
+</g>
+<g >
+<title>scythedb::NVMArena::Allocate (8 samples, 2.41%)</title><rect x="646.2" y="245" width="28.4" height="15.0" fill="rgb(233,146,38)" rx="2" ry="2" />
+<text  x="649.20" y="255.5" >sc..</text>
+</g>
+<g >
+<title>std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;::_Alloc_hider::~_Alloc_hider (1 samples, 0.30%)</title><rect x="489.8" y="277" width="3.6" height="15.0" fill="rgb(220,204,5)" rx="2" ry="2" />
+<text  x="492.82" y="287.5" ></text>
+</g>
+<g >
+<title>scythedb::NVMBlock::Add (74 samples, 22.29%)</title><rect x="198.4" y="309" width="263.0" height="15.0" fill="rgb(223,130,19)" rx="2" ry="2" />
+<text  x="201.37" y="319.5" >scythedb::NVMBlock::Add</text>
+</g>
+<g >
+<title>pmem::obj::persistent_ptr&lt;char&gt;::operator char* (1 samples, 0.30%)</title><rect x="255.2" y="213" width="3.6" height="15.0" fill="rgb(211,175,10)" rx="2" ry="2" />
+<text  x="258.24" y="223.5" ></text>
+</g>
+<g >
+<title>pmem::obj::persistent_ptr&lt;scythedb::InternalNode&gt;::get (1 samples, 0.30%)</title><rect x="233.9" y="149" width="3.6" height="15.0" fill="rgb(214,158,19)" rx="2" ry="2" />
+<text  x="236.92" y="159.5" ></text>
+</g>
+<g >
+<title>std::_Destroy&lt;std::pair&lt;std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;, std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt; &gt;*&gt; (1 samples, 0.30%)</title><rect x="617.8" y="261" width="3.5" height="15.0" fill="rgb(243,96,0)" rx="2" ry="2" />
+<text  x="620.77" y="271.5" ></text>
+</g>
+<g >
+<title>std::function&lt;void  (1 samples, 0.30%)</title><rect x="887.9" y="181" width="3.5" height="15.0" fill="rgb(241,208,2)" rx="2" ry="2" />
+<text  x="890.89" y="191.5" ></text>
+</g>
+<g >
+<title>std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;::_M_append (1 samples, 0.30%)</title><rect x="898.6" y="245" width="3.5" height="15.0" fill="rgb(213,183,41)" rx="2" ry="2" />
+<text  x="901.55" y="255.5" ></text>
+</g>
+<g >
+<title>std::uninitialized_copy&lt;std::move_iterator&lt;std::pair&lt;std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;, std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt; &gt;*&gt;, std::pair&lt;std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;, std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt; &gt;*&gt; (1 samples, 0.30%)</title><rect x="919.9" y="213" width="3.5" height="15.0" fill="rgb(254,99,13)" rx="2" ry="2" />
+<text  x="922.88" y="223.5" ></text>
+</g>
+<g >
+<title>std::function&lt;void  (2 samples, 0.60%)</title><rect x="674.6" y="213" width="7.1" height="15.0" fill="rgb(243,115,27)" rx="2" ry="2" />
+<text  x="677.64" y="223.5" ></text>
+</g>
+<g >
+<title>scythedb::NVMSkipList::NewNode (4 samples, 1.20%)</title><rect x="436.5" y="245" width="14.2" height="15.0" fill="rgb(241,23,16)" rx="2" ry="2" />
+<text  x="439.51" y="255.5" ></text>
+</g>
+<g >
+<title>std::operator!=&lt;std::pair&lt;std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;, std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt; &gt;*&gt; (1 samples, 0.30%)</title><rect x="482.7" y="213" width="3.6" height="15.0" fill="rgb(246,46,36)" rx="2" ry="2" />
+<text  x="485.71" y="223.5" ></text>
+</g>
+<g >
+<title>std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;::_M_construct&lt;char*&gt; (1 samples, 0.30%)</title><rect x="632.0" y="213" width="3.5" height="15.0" fill="rgb(221,179,44)" rx="2" ry="2" />
+<text  x="634.99" y="223.5" ></text>
+</g>
+<g >
+<title>std::_Any_data::_M_access&lt;pmem::obj::vector&lt;std::pair&lt;pmem::obj::persistent_ptr&lt;char&gt;, unsigned long&gt; &gt;::emplace_back&lt;std::pair&lt;pmem::obj::persistent_ptr&lt;char&gt;, unsigned long&gt; &gt; (1 samples, 0.30%)</title><rect x="230.4" y="69" width="3.5" height="15.0" fill="rgb(252,35,12)" rx="2" ry="2" />
+<text  x="233.36" y="79.5" ></text>
+</g>
+<g >
+<title>scythedb::NVMSkipList::FindGreaterOrEqual (56 samples, 16.87%)</title><rect x="681.7" y="229" width="199.1" height="15.0" fill="rgb(211,214,16)" rx="2" ry="2" />
+<text  x="684.75" y="239.5" >scythedb::NVMSkipList::Fin..</text>
+</g>
+<g >
+<title>std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;::basic_string (1 samples, 0.30%)</title><rect x="632.0" y="261" width="3.5" height="15.0" fill="rgb(225,219,11)" rx="2" ry="2" />
+<text  x="634.99" y="271.5" ></text>
+</g>
+<g >
+<title>std::_Function_base::_M_empty (1 samples, 0.30%)</title><rect x="799.0" y="181" width="3.6" height="15.0" fill="rgb(246,141,15)" rx="2" ry="2" />
+<text  x="802.04" y="191.5" ></text>
+</g>
+<g >
+<title>std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;::_M_dispose (1 samples, 0.30%)</title><rect x="628.4" y="213" width="3.6" height="15.0" fill="rgb(211,139,54)" rx="2" ry="2" />
+<text  x="631.43" y="223.5" ></text>
+</g>
+<g >
+<title>pmem::obj::persistent_ptr&lt;scythedb::InternalNode&gt;::operator= (2 samples, 0.60%)</title><rect x="237.5" y="165" width="7.1" height="15.0" fill="rgb(247,203,28)" rx="2" ry="2" />
+<text  x="240.47" y="175.5" ></text>
+</g>
+<g >
+<title>scythedb::NVMArena::AllocateFallback (2 samples, 0.60%)</title><rect x="667.5" y="165" width="7.1" height="15.0" fill="rgb(214,5,8)" rx="2" ry="2" />
+<text  x="670.53" y="175.5" ></text>
+</g>
+<g >
+<title>scythedb::GetVarint32Ptr (2 samples, 0.60%)</title><rect x="553.8" y="149" width="7.1" height="15.0" fill="rgb(216,74,24)" rx="2" ry="2" />
+<text  x="556.80" y="159.5" ></text>
+</g>
+<g >
+<title>std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;::_M_check_length (1 samples, 0.30%)</title><rect x="902.1" y="245" width="3.6" height="15.0" fill="rgb(215,43,17)" rx="2" ry="2" />
+<text  x="905.11" y="255.5" ></text>
+</g>
+<g >
+<title>scythedb::NVMArena::AllocateAligned (3 samples, 0.90%)</title><rect x="440.1" y="229" width="10.6" height="15.0" fill="rgb(245,158,54)" rx="2" ry="2" />
+<text  x="443.06" y="239.5" ></text>
+</g>
+<g >
+<title>pmem::obj::vector&lt;std::pair&lt;pmem::obj::persistent_ptr&lt;char&gt;, unsigned long&gt; &gt;::push_back (1 samples, 0.30%)</title><rect x="887.9" y="101" width="3.5" height="15.0" fill="rgb(234,60,30)" rx="2" ry="2" />
+<text  x="890.89" y="111.5" ></text>
+</g>
+<g >
+<title>std::vector&lt;std::pair&lt;std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;, std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt; &gt;, std::allocator&lt;std::pair&lt;std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;, std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt; &gt; &gt; &gt;::push_back (1 samples, 0.30%)</title><rect x="614.2" y="293" width="3.6" height="15.0" fill="rgb(243,227,31)" rx="2" ry="2" />
+<text  x="617.22" y="303.5" ></text>
+</g>
+<g >
+<title>scythedb::NVMBlock::RecordPersist (72 samples, 21.69%)</title><rect x="201.9" y="277" width="255.9" height="15.0" fill="rgb(216,60,34)" rx="2" ry="2" />
+<text  x="204.93" y="287.5" >scythedb::NVMBlock::RecordPersist</text>
+</g>
+<g >
+<title>std::_Function_base::~_Function_base (1 samples, 0.30%)</title><rect x="671.1" y="85" width="3.5" height="15.0" fill="rgb(223,163,24)" rx="2" ry="2" />
+<text  x="674.08" y="95.5" ></text>
+</g>
+<g >
+<title>std::__uninitialized_move_if_noexcept_a&lt;std::pair&lt;std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;, std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt; &gt;*, std::pair&lt;std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;, std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt; &gt;*, std::allocator&lt;std::pair&lt;std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;, std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt; &gt; &gt; &gt; (1 samples, 0.30%)</title><rect x="614.2" y="245" width="3.6" height="15.0" fill="rgb(216,215,53)" rx="2" ry="2" />
+<text  x="617.22" y="255.5" ></text>
+</g>
+<g >
+<title>scythedb::InternalKeyComparator::Compare (6 samples, 1.81%)</title><rect x="560.9" y="165" width="21.3" height="15.0" fill="rgb(216,147,40)" rx="2" ry="2" />
+<text  x="563.90" y="175.5" >s..</text>
+</g>
+<g >
+<title>scythedb::MakePersistent&lt;scythedb::InternalNode, char, pmem::obj::persistent_ptr&lt;char&gt; const&amp;, decltype (1 samples, 0.30%)</title><rect x="436.5" y="229" width="3.6" height="15.0" fill="rgb(218,36,48)" rx="2" ry="2" />
+<text  x="439.51" y="239.5" ></text>
+</g>
+<g >
+<title>pmem::obj::persistent_ptr&lt;char&gt;::persistent_ptr (5 samples, 1.51%)</title><rect x="728.0" y="181" width="17.7" height="15.0" fill="rgb(231,120,45)" rx="2" ry="2" />
+<text  x="730.95" y="191.5" ></text>
+</g>
+<g >
+<title>std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;::_M_append (2 samples, 0.60%)</title><rect x="624.9" y="245" width="7.1" height="15.0" fill="rgb(206,12,43)" rx="2" ry="2" />
+<text  x="627.88" y="255.5" ></text>
+</g>
+<g >
+<title>pmem::obj::persistent_ptr&lt;scythedb::InternalNode&gt;::operator= (1 samples, 0.30%)</title><rect x="674.6" y="149" width="3.6" height="15.0" fill="rgb(217,201,28)" rx="2" ry="2" />
+<text  x="677.64" y="159.5" ></text>
+</g>
+<g >
+<title>__tls_get_addr@plt (1 samples, 0.30%)</title><rect x="201.9" y="245" width="3.6" height="15.0" fill="rgb(210,44,28)" rx="2" ry="2" />
+<text  x="204.93" y="255.5" ></text>
+</g>
+<g >
+<title>_IO_vsnprintf (1 samples, 0.30%)</title><rect x="187.7" y="565" width="3.6" height="15.0" fill="rgb(233,225,7)" rx="2" ry="2" />
+<text  x="190.71" y="575.5" ></text>
+</g>
+<g >
+<title>std::__uninitialized_copy_a&lt;std::move_iterator&lt;std::pair&lt;std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;, std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt; &gt;*&gt;, std::pair&lt;std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;, std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt; &gt;*, std::pair&lt;std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;, std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt; &gt; &gt; (1 samples, 0.30%)</title><rect x="919.9" y="229" width="3.5" height="15.0" fill="rgb(240,16,9)" rx="2" ry="2" />
+<text  x="922.88" y="239.5" ></text>
+</g>
+<g >
+<title>std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;::_M_is_local (1 samples, 0.30%)</title><rect x="617.8" y="165" width="3.5" height="15.0" fill="rgb(240,89,11)" rx="2" ry="2" />
+<text  x="620.77" y="175.5" ></text>
+</g>
+<g >
+<title>std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;::_M_mutate (1 samples, 0.30%)</title><rect x="898.6" y="229" width="3.5" height="15.0" fill="rgb(232,95,37)" rx="2" ry="2" />
+<text  x="901.55" y="239.5" ></text>
+</g>
+<g >
+<title>std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;::_M_dispose (1 samples, 0.30%)</title><rect x="909.2" y="181" width="3.6" height="15.0" fill="rgb(228,57,47)" rx="2" ry="2" />
+<text  x="912.22" y="191.5" ></text>
+</g>
+<g >
+<title>std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;::size (1 samples, 0.30%)</title><rect x="912.8" y="245" width="3.5" height="15.0" fill="rgb(229,108,22)" rx="2" ry="2" />
+<text  x="915.77" y="255.5" ></text>
+</g>
+<g >
+<title>std::__invoke&lt;int  (215 samples, 64.76%)</title><rect x="191.3" y="373" width="764.1" height="15.0" fill="rgb(233,148,8)" rx="2" ry="2" />
+<text  x="194.27" y="383.5" >std::__invoke&lt;int </text>
+</g>
+<g >
+<title>std::allocator_traits&lt;std::allocator&lt;char&gt; &gt;::allocate (1 samples, 0.30%)</title><rect x="632.0" y="181" width="3.5" height="15.0" fill="rgb(228,1,26)" rx="2" ry="2" />
+<text  x="634.99" y="191.5" ></text>
+</g>
+<g >
+<title>pmem::obj::persistent_ptr&lt;scythedb::InternalNode&gt;::get (4 samples, 1.20%)</title><rect x="525.4" y="197" width="14.2" height="15.0" fill="rgb(230,104,34)" rx="2" ry="2" />
+<text  x="528.36" y="207.5" ></text>
+</g>
+<g >
+<title>scythedb::(anonymous namespace)::BytewiseComparatorImpl::Compare (1 samples, 0.30%)</title><rect x="564.5" y="149" width="3.5" height="15.0" fill="rgb(248,205,34)" rx="2" ry="2" />
+<text  x="567.46" y="159.5" ></text>
+</g>
+<g >
+<title>std::generate_canonical&lt;double, 53ul, std::linear_congruential_engine&lt;unsigned long, 16807ul, 0ul, 2147483647ul&gt; &gt; (1 samples, 0.30%)</title><rect x="951.9" y="213" width="3.5" height="15.0" fill="rgb(215,92,40)" rx="2" ry="2" />
+<text  x="954.87" y="223.5" ></text>
+</g>
+<g >
+<title>std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;::_M_local_data (1 samples, 0.30%)</title><rect x="898.6" y="181" width="3.5" height="15.0" fill="rgb(220,194,13)" rx="2" ry="2" />
+<text  x="901.55" y="191.5" ></text>
+</g>
+<g >
+<title>ycsbc::ScrambledZipfianGenerator::Next (1 samples, 0.30%)</title><rect x="941.2" y="277" width="3.6" height="15.0" fill="rgb(211,189,37)" rx="2" ry="2" />
+<text  x="944.20" y="287.5" ></text>
+</g>
+<g >
+<title>run_block_size (11 samples, 3.31%)</title><rect x="976.7" y="549" width="39.1" height="15.0" fill="rgb(244,197,53)" rx="2" ry="2" />
+<text  x="979.75" y="559.5" >run..</text>
+</g>
+<g >
+<title>std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;::basic_string (1 samples, 0.30%)</title><rect x="486.3" y="213" width="3.5" height="15.0" fill="rgb(251,117,1)" rx="2" ry="2" />
+<text  x="489.27" y="223.5" ></text>
+</g>
+<g >
+<title>scythedb::Slice::size (2 samples, 0.60%)</title><rect x="859.5" y="101" width="7.1" height="15.0" fill="rgb(251,96,14)" rx="2" ry="2" />
+<text  x="862.46" y="111.5" ></text>
+</g>
+<g >
+<title>scythedb::NVMSkipList::FindGreaterOrEqual (54 samples, 16.27%)</title><rect x="244.6" y="245" width="191.9" height="15.0" fill="rgb(240,146,26)" rx="2" ry="2" />
+<text  x="247.58" y="255.5" >scythedb::NVMSkipList::Fi..</text>
+</g>
+<g >
+<title>_int_free (4 samples, 1.20%)</title><rect x="1122.5" y="581" width="14.2" height="15.0" fill="rgb(234,32,39)" rx="2" ry="2" />
+<text  x="1125.47" y="591.5" ></text>
+</g>
+<g >
+<title>std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;::_S_copy (4 samples, 1.20%)</title><rect x="592.9" y="229" width="14.2" height="15.0" fill="rgb(207,194,23)" rx="2" ry="2" />
+<text  x="595.89" y="239.5" ></text>
+</g>
+<g >
+<title>std::_Function_base::_Function_base (1 samples, 0.30%)</title><rect x="891.4" y="213" width="3.6" height="15.0" fill="rgb(239,12,19)" rx="2" ry="2" />
+<text  x="894.45" y="223.5" ></text>
+</g>
+<g >
+<title>std::_Any_data::_M_access&lt;pmem::obj::vector&lt;std::pair&lt;pmem::obj::persistent_ptr&lt;char&gt;, unsigned long&gt; &gt;::emplace_back&lt;std::pair&lt;pmem::obj::persistent_ptr&lt;char&gt;, unsigned long&gt; &gt; (1 samples, 0.30%)</title><rect x="671.1" y="53" width="3.5" height="15.0" fill="rgb(248,42,9)" rx="2" ry="2" />
+<text  x="674.08" y="63.5" ></text>
+</g>
+<g >
+<title>std::call_once&lt;void  (215 samples, 64.76%)</title><rect x="191.3" y="549" width="764.1" height="15.0" fill="rgb(216,108,50)" rx="2" ry="2" />
+<text  x="194.27" y="559.5" >std::call_once&lt;void </text>
+</g>
+<g >
+<title>std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;::basic_string (1 samples, 0.30%)</title><rect x="610.7" y="261" width="3.5" height="15.0" fill="rgb(238,6,1)" rx="2" ry="2" />
+<text  x="613.66" y="271.5" ></text>
+</g>
+<g >
+<title>pmem::obj::persistent_ptr&lt;scythedb::InternalNode&gt;::get (13 samples, 3.92%)</title><rect x="749.3" y="165" width="46.2" height="15.0" fill="rgb(213,221,44)" rx="2" ry="2" />
+<text  x="752.28" y="175.5" >pmem..</text>
+</g>
+<g >
+<title>scythedb::NVMBlock::NVMBlock (12 samples, 3.61%)</title><rect x="539.6" y="197" width="42.6" height="15.0" fill="rgb(236,158,43)" rx="2" ry="2" />
+<text  x="542.58" y="207.5" >scyt..</text>
+</g>
+<g >
+<title>std::operator!=&lt;std::pair&lt;std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;, std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt; &gt;*&gt; (1 samples, 0.30%)</title><rect x="919.9" y="181" width="3.5" height="15.0" fill="rgb(230,107,15)" rx="2" ry="2" />
+<text  x="922.88" y="191.5" ></text>
+</g>
+<g >
+<title>scythedb::NVMSkipList::KeyIsAfterNode (53 samples, 15.96%)</title><rect x="685.3" y="213" width="188.4" height="15.0" fill="rgb(242,148,52)" rx="2" ry="2" />
+<text  x="688.30" y="223.5" >scythedb::NVMSkipList::K..</text>
+</g>
+<g >
+<title>[unknown] (18 samples, 5.42%)</title><rect x="123.7" y="565" width="64.0" height="15.0" fill="rgb(231,111,21)" rx="2" ry="2" />
+<text  x="126.73" y="575.5" >[unknown]</text>
+</g>
+<g >
+<title>std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;::_M_construct&lt;char*&gt; (1 samples, 0.30%)</title><rect x="610.7" y="245" width="3.5" height="15.0" fill="rgb(219,176,20)" rx="2" ry="2" />
+<text  x="613.66" y="255.5" ></text>
+</g>
+<g >
+<title>std::thread::_Invoker&lt;std::tuple&lt;int  (215 samples, 64.76%)</title><rect x="191.3" y="389" width="764.1" height="15.0" fill="rgb(227,171,22)" rx="2" ry="2" />
+<text  x="194.27" y="399.5" >std::thread::_Invoker&lt;std::tuple&lt;int </text>
+</g>
+<g >
+<title>scythedb::Slice::compare (1 samples, 0.30%)</title><rect x="564.5" y="133" width="3.5" height="15.0" fill="rgb(248,95,36)" rx="2" ry="2" />
+<text  x="567.46" y="143.5" ></text>
+</g>
+<g >
+<title>ycsbc::CoreWorkload::BuildValues (6 samples, 1.81%)</title><rect x="468.5" y="309" width="21.3" height="15.0" fill="rgb(250,2,0)" rx="2" ry="2" />
+<text  x="471.49" y="319.5" >y..</text>
+</g>
+<g >
+<title>pmem::obj::persistent_ptr&lt;char&gt;::operator char* (2 samples, 0.60%)</title><rect x="504.0" y="229" width="7.1" height="15.0" fill="rgb(216,61,47)" rx="2" ry="2" />
+<text  x="507.04" y="239.5" ></text>
+</g>
+<g >
+<title>__pthread_once_slow (215 samples, 64.76%)</title><rect x="191.3" y="565" width="764.1" height="15.0" fill="rgb(227,147,29)" rx="2" ry="2" />
+<text  x="194.27" y="575.5" >__pthread_once_slow</text>
+</g>
+<g >
+<title>std::_Function_handler&lt;void  (3 samples, 0.90%)</title><rect x="233.9" y="213" width="10.7" height="15.0" fill="rgb(208,186,37)" rx="2" ry="2" />
+<text  x="236.92" y="223.5" ></text>
+</g>
+<g >
+<title>vfprintf (1 samples, 0.30%)</title><rect x="187.7" y="549" width="3.6" height="15.0" fill="rgb(237,19,49)" rx="2" ry="2" />
+<text  x="190.71" y="559.5" ></text>
+</g>
+<g >
+<title>pmem::obj::persistent_ptr&lt;std::pair&lt;pmem::obj::persistent_ptr&lt;char&gt;, unsigned long&gt; []&gt;::operator[]&lt;std::enable_if&lt;true, void&gt; &gt; (1 samples, 0.30%)</title><rect x="887.9" y="53" width="3.5" height="15.0" fill="rgb(222,158,0)" rx="2" ry="2" />
+<text  x="890.89" y="63.5" ></text>
+</g>
+<g >
+<title>scythedb::NVMArena::AllocateFallback (1 samples, 0.30%)</title><rect x="447.2" y="149" width="3.5" height="15.0" fill="rgb(235,162,26)" rx="2" ry="2" />
+<text  x="450.17" y="159.5" ></text>
+</g>
+<g >
+<title>std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;::_M_mutate (2 samples, 0.60%)</title><rect x="624.9" y="229" width="7.1" height="15.0" fill="rgb(234,109,24)" rx="2" ry="2" />
+<text  x="627.88" y="239.5" ></text>
+</g>
+<g >
+<title>std::function&lt;void  (7 samples, 2.11%)</title><rect x="209.0" y="229" width="24.9" height="15.0" fill="rgb(212,70,52)" rx="2" ry="2" />
+<text  x="212.04" y="239.5" >s..</text>
+</g>
+<g >
+<title>std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;::append (1 samples, 0.30%)</title><rect x="457.8" y="277" width="3.6" height="15.0" fill="rgb(246,21,46)" rx="2" ry="2" />
+<text  x="460.83" y="287.5" ></text>
+</g>
+<g >
+<title>std::pointer_traits&lt;char const*&gt;::pointer_to (1 samples, 0.30%)</title><rect x="909.2" y="133" width="3.6" height="15.0" fill="rgb(237,61,26)" rx="2" ry="2" />
+<text  x="912.22" y="143.5" ></text>
+</g>
+<g >
+<title>std::function&lt;void  (1 samples, 0.30%)</title><rect x="230.4" y="117" width="3.5" height="15.0" fill="rgb(239,189,33)" rx="2" ry="2" />
+<text  x="233.36" y="127.5" ></text>
+</g>
+<g >
+<title>scythedb::NVMSkipList::Iterator::SeekGreaterOrEqual (27 samples, 8.13%)</title><rect x="496.9" y="277" width="96.0" height="15.0" fill="rgb(233,5,3)" rx="2" ry="2" />
+<text  x="499.93" y="287.5" >scythedb::N..</text>
+</g>
+<g >
+<title>pmem::obj::vector&lt;std::pair&lt;pmem::obj::persistent_ptr&lt;char&gt;, unsigned long&gt; &gt;::add_data_to_tx (1 samples, 0.30%)</title><rect x="223.3" y="53" width="3.5" height="15.0" fill="rgb(226,75,7)" rx="2" ry="2" />
+<text  x="226.25" y="63.5" ></text>
+</g>
+<g >
+<title>std::uninitialized_copy&lt;std::move_iterator&lt;std::pair&lt;std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;, std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt; &gt;*&gt;, std::pair&lt;std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;, std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt; &gt;*&gt; (1 samples, 0.30%)</title><rect x="482.7" y="229" width="3.6" height="15.0" fill="rgb(241,145,52)" rx="2" ry="2" />
+<text  x="485.71" y="239.5" ></text>
+</g>
+<g >
+<title>scythedb::(anonymous namespace)::BytewiseComparatorImpl::Compare (2 samples, 0.60%)</title><rect x="401.0" y="133" width="7.1" height="15.0" fill="rgb(243,223,17)" rx="2" ry="2" />
+<text  x="403.96" y="143.5" ></text>
+</g>
+<g >
+<title>scythedb::NVMSkipList::Node::Next (2 samples, 0.60%)</title><rect x="429.4" y="229" width="7.1" height="15.0" fill="rgb(224,161,9)" rx="2" ry="2" />
+<text  x="432.40" y="239.5" ></text>
+</g>
+<g >
+<title>std::_Function_handler&lt;void  (7 samples, 2.11%)</title><rect x="209.0" y="213" width="24.9" height="15.0" fill="rgb(205,131,35)" rx="2" ry="2" />
+<text  x="212.04" y="223.5" >s..</text>
+</g>
+<g >
+<title>std::vector&lt;std::pair&lt;std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;, std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt; &gt;, std::allocator&lt;std::pair&lt;std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;, std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt; &gt; &gt; &gt;::push_back (2 samples, 0.60%)</title><rect x="916.3" y="277" width="7.1" height="15.0" fill="rgb(229,194,18)" rx="2" ry="2" />
+<text  x="919.33" y="287.5" ></text>
+</g>
+<g >
+<title>scythedb::NVMArena::AllocateNewChunk (1 samples, 0.30%)</title><rect x="447.2" y="133" width="3.5" height="15.0" fill="rgb(235,101,51)" rx="2" ry="2" />
+<text  x="450.17" y="143.5" ></text>
+</g>
+<g >
+<title>pmem::obj::persistent_ptr&lt;char&gt;::persistent_ptr (4 samples, 1.20%)</title><rect x="511.1" y="213" width="14.3" height="15.0" fill="rgb(205,85,39)" rx="2" ry="2" />
+<text  x="514.14" y="223.5" ></text>
+</g>
+<g >
+<title>utils::FNVHash64 (1 samples, 0.30%)</title><rect x="937.7" y="245" width="3.5" height="15.0" fill="rgb(234,71,13)" rx="2" ry="2" />
+<text  x="940.65" y="255.5" ></text>
+</g>
+<g >
+<title>std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;::basic_string (1 samples, 0.30%)</title><rect x="493.4" y="293" width="3.5" height="15.0" fill="rgb(242,42,49)" rx="2" ry="2" />
+<text  x="496.37" y="303.5" ></text>
+</g>
+<g >
+<title>std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;::append (2 samples, 0.60%)</title><rect x="898.6" y="261" width="7.1" height="15.0" fill="rgb(205,76,51)" rx="2" ry="2" />
+<text  x="901.55" y="271.5" ></text>
+</g>
+<g >
+<title>pmem::obj::transaction::run&lt;&gt; (2 samples, 0.60%)</title><rect x="223.3" y="117" width="7.1" height="15.0" fill="rgb(225,62,49)" rx="2" ry="2" />
+<text  x="226.25" y="127.5" ></text>
+</g>
+<g >
+<title>std::thread::_Invoker&lt;std::tuple&lt;int  (215 samples, 64.76%)</title><rect x="191.3" y="405" width="764.1" height="15.0" fill="rgb(251,28,44)" rx="2" ry="2" />
+<text  x="194.27" y="415.5" >std::thread::_Invoker&lt;std::tuple&lt;int </text>
+</g>
+<g >
+<title>operation_start (1 samples, 0.30%)</title><rect x="155.7" y="549" width="3.6" height="15.0" fill="rgb(247,190,53)" rx="2" ry="2" />
+<text  x="158.72" y="559.5" ></text>
+</g>
+<g >
+<title>std::allocator&lt;char&gt;::~allocator (1 samples, 0.30%)</title><rect x="934.1" y="261" width="3.6" height="15.0" fill="rgb(210,50,29)" rx="2" ry="2" />
+<text  x="937.10" y="271.5" ></text>
+</g>
+<g >
+<title>std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;::_M_local_data (1 samples, 0.30%)</title><rect x="909.2" y="149" width="3.6" height="15.0" fill="rgb(247,126,43)" rx="2" ry="2" />
+<text  x="912.22" y="159.5" ></text>
+</g>
+<g >
+<title>std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;::~basic_string (2 samples, 0.60%)</title><rect x="461.4" y="309" width="7.1" height="15.0" fill="rgb(234,186,24)" rx="2" ry="2" />
+<text  x="464.39" y="319.5" ></text>
+</g>
+<g >
+<title>pmem::obj::persistent_ptr&lt;scythedb::InternalNode&gt;::get (2 samples, 0.60%)</title><rect x="290.8" y="197" width="7.1" height="15.0" fill="rgb(222,69,27)" rx="2" ry="2" />
+<text  x="293.78" y="207.5" ></text>
+</g>
+<g >
+<title>scythedb::Slice::compare (1 samples, 0.30%)</title><rect x="404.5" y="117" width="3.6" height="15.0" fill="rgb(219,51,25)" rx="2" ry="2" />
+<text  x="407.52" y="127.5" ></text>
+</g>
+<g >
+<title>std::move_iterator&lt;std::pair&lt;std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;, std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt; &gt;*&gt;::base (1 samples, 0.30%)</title><rect x="919.9" y="149" width="3.5" height="15.0" fill="rgb(242,188,36)" rx="2" ry="2" />
+<text  x="922.88" y="159.5" ></text>
+</g>
+<g >
+<title>std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;::append (1 samples, 0.30%)</title><rect x="912.8" y="277" width="3.5" height="15.0" fill="rgb(215,60,0)" rx="2" ry="2" />
+<text  x="915.77" y="287.5" ></text>
+</g>
+<g >
+<title>std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;::_M_construct&lt;char*&gt; (1 samples, 0.30%)</title><rect x="610.7" y="213" width="3.5" height="15.0" fill="rgb(253,171,51)" rx="2" ry="2" />
+<text  x="613.66" y="223.5" ></text>
+</g>
+<g >
+<title>malloc (1 samples, 0.30%)</title><rect x="1140.2" y="581" width="3.6" height="15.0" fill="rgb(246,147,40)" rx="2" ry="2" />
+<text  x="1143.24" y="591.5" ></text>
+</g>
+<g >
+<title>__gnu_cxx::new_allocator&lt;char&gt;::max_size (1 samples, 0.30%)</title><rect x="902.1" y="197" width="3.6" height="15.0" fill="rgb(230,26,26)" rx="2" ry="2" />
+<text  x="905.11" y="207.5" ></text>
+</g>
+<g >
+<title>std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;::_M_dispose (1 samples, 0.30%)</title><rect x="930.5" y="245" width="3.6" height="15.0" fill="rgb(249,17,39)" rx="2" ry="2" />
+<text  x="933.54" y="255.5" ></text>
+</g>
+<g >
+<title>scythedb::NVMArena::AllocateAligned (1 samples, 0.30%)</title><rect x="887.9" y="149" width="3.5" height="15.0" fill="rgb(222,4,43)" rx="2" ry="2" />
+<text  x="890.89" y="159.5" ></text>
+</g>
+<g >
+<title>std::vector&lt;std::pair&lt;std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;, std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt; &gt;, std::allocator&lt;std::pair&lt;std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;, std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt; &gt; &gt; &gt;::_M_realloc_insert&lt;std::pair&lt;std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;, std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt; &gt; const&amp;&gt; (3 samples, 0.90%)</title><rect x="479.2" y="277" width="10.6" height="15.0" fill="rgb(226,191,5)" rx="2" ry="2" />
+<text  x="482.16" y="287.5" ></text>
+</g>
+<g >
+<title>std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;::_M_local_data (1 samples, 0.30%)</title><rect x="464.9" y="277" width="3.6" height="15.0" fill="rgb(233,83,41)" rx="2" ry="2" />
+<text  x="467.94" y="287.5" ></text>
+</g>
+<g >
+<title>pmem::obj::vector&lt;std::pair&lt;pmem::obj::persistent_ptr&lt;char&gt;, unsigned long&gt; &gt;::emplace_back&lt;std::pair&lt;pmem::obj::persistent_ptr&lt;char&gt;, unsigned long&gt; &gt; (1 samples, 0.30%)</title><rect x="887.9" y="85" width="3.5" height="15.0" fill="rgb(222,203,42)" rx="2" ry="2" />
+<text  x="890.89" y="95.5" ></text>
+</g>
+<g >
+<title>pmemobj_tx_xadd_range_direct (3 samples, 0.90%)</title><rect x="1179.3" y="581" width="10.7" height="15.0" fill="rgb(217,47,32)" rx="2" ry="2" />
+<text  x="1182.34" y="591.5" ></text>
+</g>
+<g >
+<title>obj_norep_flush (11 samples, 3.31%)</title><rect x="976.7" y="565" width="39.1" height="15.0" fill="rgb(228,49,43)" rx="2" ry="2" />
+<text  x="979.75" y="575.5" >obj..</text>
+</g>
+<g >
+<title>scythedb::Slice::data (1 samples, 0.30%)</title><rect x="418.7" y="133" width="3.6" height="15.0" fill="rgb(229,101,5)" rx="2" ry="2" />
+<text  x="421.73" y="143.5" ></text>
+</g>
+<g >
+<title>pmem::obj::transaction::run&lt;&gt; (2 samples, 0.60%)</title><rect x="674.6" y="229" width="7.1" height="15.0" fill="rgb(209,6,5)" rx="2" ry="2" />
+<text  x="677.64" y="239.5" ></text>
+</g>
+<g >
+<title>_int_free (6 samples, 1.81%)</title><rect x="127.3" y="549" width="21.3" height="15.0" fill="rgb(233,35,54)" rx="2" ry="2" />
+<text  x="130.29" y="559.5" >_..</text>
+</g>
+<g >
+<title>std::vector&lt;std::pair&lt;std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;, std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt; &gt;, std::allocator&lt;std::pair&lt;std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;, std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt; &gt; &gt; &gt;::push_back (3 samples, 0.90%)</title><rect x="479.2" y="293" width="10.6" height="15.0" fill="rgb(224,218,22)" rx="2" ry="2" />
+<text  x="482.16" y="303.5" ></text>
+</g>
+<g >
+<title>pmem::obj::vector&lt;std::pair&lt;pmem::obj::persistent_ptr&lt;char&gt;, unsigned long&gt; &gt;::emplace_back&lt;std::pair&lt;pmem::obj::persistent_ptr&lt;char&gt;, unsigned long&gt; &gt; (1 samples, 0.30%)</title><rect x="671.1" y="117" width="3.5" height="15.0" fill="rgb(235,32,11)" rx="2" ry="2" />
+<text  x="674.08" y="127.5" ></text>
+</g>
+<g >
+<title>std::_Function_base::_Base_manager&lt;pmem::obj::vector&lt;std::pair&lt;pmem::obj::persistent_ptr&lt;char&gt;, unsigned long&gt; &gt;::emplace_back&lt;std::pair&lt;pmem::obj::persistent_ptr&lt;char&gt;, unsigned long&gt; &gt; (1 samples, 0.30%)</title><rect x="671.1" y="69" width="3.5" height="15.0" fill="rgb(228,81,44)" rx="2" ry="2" />
+<text  x="674.08" y="79.5" ></text>
+</g>
+<g >
+<title>ulog_free_next (8 samples, 2.41%)</title><rect x="159.3" y="549" width="28.4" height="15.0" fill="rgb(235,109,14)" rx="2" ry="2" />
+<text  x="162.28" y="559.5" >ul..</text>
+</g>
+<g >
+<title>std::_Destroy_aux&lt;false&gt;::__destroy&lt;std::pair&lt;std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;, std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt; &gt;*&gt; (1 samples, 0.30%)</title><rect x="617.8" y="245" width="3.5" height="15.0" fill="rgb(248,199,52)" rx="2" ry="2" />
+<text  x="620.77" y="255.5" ></text>
+</g>
+<g >
+<title>scythedb::Slice::size (1 samples, 0.30%)</title><rect x="575.1" y="133" width="3.6" height="15.0" fill="rgb(229,174,52)" rx="2" ry="2" />
+<text  x="578.12" y="143.5" ></text>
+</g>
+<g >
+<title>std::_Function_handler&lt;void  (1 samples, 0.30%)</title><rect x="447.2" y="181" width="3.5" height="15.0" fill="rgb(242,188,38)" rx="2" ry="2" />
+<text  x="450.17" y="191.5" ></text>
+</g>
+<g >
+<title>std::_Function_handler&lt;int  (20 samples, 6.02%)</title><rect x="802.6" y="181" width="71.1" height="15.0" fill="rgb(205,78,27)" rx="2" ry="2" />
+<text  x="805.59" y="191.5" >std::_Fu..</text>
+</g>
+<g >
+<title>scythedb::NVMArena::AllocateNewChunk (1 samples, 0.30%)</title><rect x="887.9" y="117" width="3.5" height="15.0" fill="rgb(227,131,12)" rx="2" ry="2" />
+<text  x="890.89" y="127.5" ></text>
+</g>
+<g >
+<title>std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;::_M_create (1 samples, 0.30%)</title><rect x="632.0" y="197" width="3.5" height="15.0" fill="rgb(214,146,40)" rx="2" ry="2" />
+<text  x="634.99" y="207.5" ></text>
+</g>
+<g >
+<title>pmem::obj::vector&lt;std::pair&lt;pmem::obj::persistent_ptr&lt;char&gt;, unsigned long&gt; &gt;::push_back (3 samples, 0.90%)</title><rect x="223.3" y="149" width="10.6" height="15.0" fill="rgb(250,120,46)" rx="2" ry="2" />
+<text  x="226.25" y="159.5" ></text>
+</g>
+<g >
+<title>[libpmem.so.1.0.0] (32 samples, 9.64%)</title><rect x="10.0" y="565" width="113.7" height="15.0" fill="rgb(254,211,37)" rx="2" ry="2" />
+<text  x="13.00" y="575.5" >[libpmem.so.1...</text>
+</g>
+<g >
+<title>scythedb::GetLengthPrefixedSlice (8 samples, 2.41%)</title><rect x="813.3" y="133" width="28.4" height="15.0" fill="rgb(249,190,13)" rx="2" ry="2" />
+<text  x="816.25" y="143.5" >sc..</text>
+</g>
+<g >
+<title>ycsbc::Client::DoTransaction (129 samples, 38.86%)</title><rect x="496.9" y="325" width="458.5" height="15.0" fill="rgb(250,74,29)" rx="2" ry="2" />
+<text  x="499.93" y="335.5" >ycsbc::Client::DoTransaction</text>
+</g>
+<g >
+<title>std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;::~basic_string (1 samples, 0.30%)</title><rect x="635.5" y="261" width="3.6" height="15.0" fill="rgb(253,188,6)" rx="2" ry="2" />
+<text  x="638.54" y="271.5" ></text>
+</g>
+<g >
+<title>std::__uninitialized_move_if_noexcept_a&lt;std::pair&lt;std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;, std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt; &gt;*, std::pair&lt;std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;, std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt; &gt;*, std::allocator&lt;std::pair&lt;std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;, std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt; &gt; &gt; &gt; (2 samples, 0.60%)</title><rect x="916.3" y="245" width="7.1" height="15.0" fill="rgb(225,79,29)" rx="2" ry="2" />
+<text  x="919.33" y="255.5" ></text>
+</g>
+<g >
+<title>pmemobj_tx_add_common.constprop.20 (5 samples, 1.51%)</title><rect x="1030.1" y="565" width="17.7" height="15.0" fill="rgb(232,99,44)" rx="2" ry="2" />
+<text  x="1033.06" y="575.5" ></text>
+</g>
+<g >
+<title>pmemobj_tx_add_snapshot.constprop.25 (14 samples, 4.22%)</title><rect x="1047.8" y="565" width="49.8" height="15.0" fill="rgb(235,17,20)" rx="2" ry="2" />
+<text  x="1050.83" y="575.5" >pmemo..</text>
+</g>
+<g >
+<title>std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;::_M_mutate (4 samples, 1.20%)</title><rect x="592.9" y="245" width="14.2" height="15.0" fill="rgb(225,178,18)" rx="2" ry="2" />
+<text  x="595.89" y="255.5" ></text>
+</g>
+<g >
+<title>ycsbc::DelegateClient (215 samples, 64.76%)</title><rect x="191.3" y="341" width="764.1" height="15.0" fill="rgb(211,8,50)" rx="2" ry="2" />
+<text  x="194.27" y="351.5" >ycsbc::DelegateClient</text>
+</g>
+<g >
+<title>scythedb::NVMSkipList::Insert (3 samples, 0.90%)</title><rect x="233.9" y="197" width="10.7" height="15.0" fill="rgb(224,159,47)" rx="2" ry="2" />
+<text  x="236.92" y="207.5" ></text>
+</g>
+<g >
+<title>std::pair&lt;std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;, std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt; &gt;::~pair (1 samples, 0.30%)</title><rect x="909.2" y="213" width="3.6" height="15.0" fill="rgb(232,113,32)" rx="2" ry="2" />
+<text  x="912.22" y="223.5" ></text>
+</g>
+<g >
+<title>std::__future_base::_State_baseV2::_M_do_set (215 samples, 64.76%)</title><rect x="191.3" y="469" width="764.1" height="15.0" fill="rgb(225,192,36)" rx="2" ry="2" />
+<text  x="194.27" y="479.5" >std::__future_base::_State_baseV2::_M_do_set</text>
+</g>
+<g >
+<title>std::vector&lt;std::pair&lt;std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;, std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt; &gt;, std::allocator&lt;std::pair&lt;std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;, std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt; &gt; &gt; &gt;::_M_realloc_insert&lt;std::pair&lt;std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;, std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt; &gt; const&amp;&gt; (2 samples, 0.60%)</title><rect x="916.3" y="261" width="7.1" height="15.0" fill="rgb(238,190,24)" rx="2" ry="2" />
+<text  x="919.33" y="271.5" ></text>
+</g>
+<g >
+<title>__memcmp_avx2_movbe (2 samples, 0.60%)</title><rect x="848.8" y="101" width="7.1" height="15.0" fill="rgb(243,14,22)" rx="2" ry="2" />
+<text  x="851.80" y="111.5" ></text>
+</g>
+<g >
+<title>std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;::_M_data (1 samples, 0.30%)</title><rect x="607.1" y="261" width="3.6" height="15.0" fill="rgb(235,25,35)" rx="2" ry="2" />
+<text  x="610.11" y="271.5" ></text>
+</g>
+<g >
+<title>__tls_get_addr@plt (3 samples, 0.90%)</title><rect x="646.2" y="229" width="10.7" height="15.0" fill="rgb(237,141,27)" rx="2" ry="2" />
+<text  x="649.20" y="239.5" ></text>
+</g>
+<g >
+<title>scythedb::NVMSkipList::Node::Next (2 samples, 0.60%)</title><rect x="873.7" y="213" width="7.1" height="15.0" fill="rgb(249,44,29)" rx="2" ry="2" />
+<text  x="876.67" y="223.5" ></text>
+</g>
+<g >
+<title>pmem::obj::p&lt;unsigned long&gt;::operator unsigned long (3 samples, 0.90%)</title><rect x="656.9" y="165" width="10.6" height="15.0" fill="rgb(250,153,1)" rx="2" ry="2" />
+<text  x="659.87" y="175.5" ></text>
+</g>
+<g >
+<title>std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;::_M_is_local (1 samples, 0.30%)</title><rect x="628.4" y="197" width="3.6" height="15.0" fill="rgb(205,220,36)" rx="2" ry="2" />
+<text  x="631.43" y="207.5" ></text>
+</g>
+<g >
+<title>std::pair&lt;std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;, std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt; &gt;::pair&lt;std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;, std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;, true&gt; (1 samples, 0.30%)</title><rect x="475.6" y="293" width="3.6" height="15.0" fill="rgb(233,145,45)" rx="2" ry="2" />
+<text  x="478.60" y="303.5" ></text>
+</g>
+<g >
+<title>ulog_clobber (3 samples, 0.90%)</title><rect x="1104.7" y="565" width="10.7" height="15.0" fill="rgb(226,195,43)" rx="2" ry="2" />
+<text  x="1107.70" y="575.5" ></text>
+</g>
+<g >
+<title>ycsbc::ZipfianGenerator::Next (1 samples, 0.30%)</title><rect x="941.2" y="261" width="3.6" height="15.0" fill="rgb(219,209,35)" rx="2" ry="2" />
+<text  x="944.20" y="271.5" ></text>
+</g>
+<g >
+<title>std::pair&lt;std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;, std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt; &gt;::pair (1 samples, 0.30%)</title><rect x="486.3" y="229" width="3.5" height="15.0" fill="rgb(243,109,37)" rx="2" ry="2" />
+<text  x="489.27" y="239.5" ></text>
+</g>
+<g >
+<title>pmem::obj::operator+=&lt;unsigned long, unsigned long&gt; (1 samples, 0.30%)</title><rect x="219.7" y="149" width="3.6" height="15.0" fill="rgb(212,94,53)" rx="2" ry="2" />
+<text  x="222.70" y="159.5" ></text>
+</g>
+<g >
+<title>scythedb::NVMSkipList::Insert (1 samples, 0.30%)</title><rect x="674.6" y="181" width="3.6" height="15.0" fill="rgb(237,62,22)" rx="2" ry="2" />
+<text  x="677.64" y="191.5" ></text>
+</g>
+<g >
+<title>scythedb::NVMSkipList::Insert (62 samples, 18.67%)</title><rect x="674.6" y="245" width="220.4" height="15.0" fill="rgb(247,180,43)" rx="2" ry="2" />
+<text  x="677.64" y="255.5" >scythedb::NVMSkipList::Insert</text>
+</g>
+<g >
+<title>std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;::_S_copy (1 samples, 0.30%)</title><rect x="923.4" y="213" width="3.6" height="15.0" fill="rgb(225,153,29)" rx="2" ry="2" />
+<text  x="926.43" y="223.5" ></text>
+</g>
+<g >
+<title>scythedb::NVMArena::Allocate (5 samples, 1.51%)</title><rect x="656.9" y="181" width="17.7" height="15.0" fill="rgb(240,35,8)" rx="2" ry="2" />
+<text  x="659.87" y="191.5" ></text>
+</g>
+<g >
+<title>std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;::_M_data (1 samples, 0.30%)</title><rect x="617.8" y="149" width="3.5" height="15.0" fill="rgb(215,92,19)" rx="2" ry="2" />
+<text  x="620.77" y="159.5" ></text>
+</g>
+<g >
+<title>scythedb::NVMBlock::KeyComparator::Compare (12 samples, 3.61%)</title><rect x="539.6" y="181" width="42.6" height="15.0" fill="rgb(246,204,30)" rx="2" ry="2" />
+<text  x="542.58" y="191.5" >scyt..</text>
+</g>
+<g >
+<title>std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;::~basic_string (1 samples, 0.30%)</title><rect x="617.8" y="197" width="3.5" height="15.0" fill="rgb(253,200,46)" rx="2" ry="2" />
+<text  x="620.77" y="207.5" ></text>
+</g>
+<g >
+<title>std::vector&lt;std::pair&lt;std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;, std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt; &gt;, std::allocator&lt;std::pair&lt;std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;, std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt; &gt; &gt; &gt;::_M_realloc_insert&lt;std::pair&lt;std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;, std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt; &gt; &gt; (1 samples, 0.30%)</title><rect x="614.2" y="261" width="3.6" height="15.0" fill="rgb(220,24,48)" rx="2" ry="2" />
+<text  x="617.22" y="271.5" ></text>
+</g>
+<g >
+<title>std::forward&lt;char const*&gt; (1 samples, 0.30%)</title><rect x="425.8" y="197" width="3.6" height="15.0" fill="rgb(214,105,7)" rx="2" ry="2" />
+<text  x="428.84" y="207.5" ></text>
+</g>
+<g >
+<title>std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;::_M_destroy (1 samples, 0.30%)</title><rect x="930.5" y="229" width="3.6" height="15.0" fill="rgb(216,179,54)" rx="2" ry="2" />
+<text  x="933.54" y="239.5" ></text>
+</g>
+<g >
+<title>scythedb::GetLengthPrefixedSlice (3 samples, 0.90%)</title><rect x="550.2" y="165" width="10.7" height="15.0" fill="rgb(232,130,23)" rx="2" ry="2" />
+<text  x="553.24" y="175.5" ></text>
+</g>
+<g >
+<title>std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;::_M_append (1 samples, 0.30%)</title><rect x="923.4" y="245" width="3.6" height="15.0" fill="rgb(218,34,33)" rx="2" ry="2" />
+<text  x="926.43" y="255.5" ></text>
+</g>
+<g >
+<title>ycsbc::CoreWorkload::NextOperation (3 samples, 0.90%)</title><rect x="944.8" y="309" width="10.6" height="15.0" fill="rgb(228,220,3)" rx="2" ry="2" />
+<text  x="947.76" y="319.5" ></text>
+</g>
+<g >
+<title>scythedb::NVMArena::Allocate (7 samples, 2.11%)</title><rect x="209.0" y="197" width="24.9" height="15.0" fill="rgb(235,213,47)" rx="2" ry="2" />
+<text  x="212.04" y="207.5" >s..</text>
+</g>
+<g >
+<title>std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;::_M_construct&lt;char*&gt; (1 samples, 0.30%)</title><rect x="927.0" y="213" width="3.5" height="15.0" fill="rgb(250,148,23)" rx="2" ry="2" />
+<text  x="929.99" y="223.5" ></text>
+</g>
+<g >
+<title>scythedb::NVMBlock::Add (74 samples, 22.29%)</title><rect x="198.4" y="293" width="263.0" height="15.0" fill="rgb(222,169,0)" rx="2" ry="2" />
+<text  x="201.37" y="303.5" >scythedb::NVMBlock::Add</text>
+</g>
+<g >
+<title>scythedb::NVMArena::Allocate (9 samples, 2.71%)</title><rect x="201.9" y="261" width="32.0" height="15.0" fill="rgb(207,62,47)" rx="2" ry="2" />
+<text  x="204.93" y="271.5" >sc..</text>
+</g>
+<g >
+<title>utils::Hash (1 samples, 0.30%)</title><rect x="937.7" y="261" width="3.5" height="15.0" fill="rgb(248,116,22)" rx="2" ry="2" />
+<text  x="940.65" y="271.5" ></text>
+</g>
+<g >
+<title>ycsbc::CoreWorkload::BuildKeyName[abi:cxx11] (4 samples, 1.20%)</title><rect x="624.9" y="277" width="14.2" height="15.0" fill="rgb(247,168,10)" rx="2" ry="2" />
+<text  x="627.88" y="287.5" ></text>
+</g>
+<g >
+<title>std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;::append (1 samples, 0.30%)</title><rect x="923.4" y="261" width="3.6" height="15.0" fill="rgb(225,6,13)" rx="2" ry="2" />
+<text  x="926.43" y="271.5" ></text>
+</g>
+<g >
+<title>std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;::_M_data (1 samples, 0.30%)</title><rect x="457.8" y="229" width="3.6" height="15.0" fill="rgb(254,184,48)" rx="2" ry="2" />
+<text  x="460.83" y="239.5" ></text>
+</g>
+<g >
+<title>std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;::max_size (1 samples, 0.30%)</title><rect x="902.1" y="229" width="3.6" height="15.0" fill="rgb(241,95,28)" rx="2" ry="2" />
+<text  x="905.11" y="239.5" ></text>
+</g>
+<g >
+<title>std::function&lt;void  (3 samples, 0.90%)</title><rect x="233.9" y="229" width="10.7" height="15.0" fill="rgb(254,93,5)" rx="2" ry="2" />
+<text  x="236.92" y="239.5" ></text>
+</g>
+<g >
+<title>std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;::_M_dispose (1 samples, 0.30%)</title><rect x="617.8" y="181" width="3.5" height="15.0" fill="rgb(211,190,47)" rx="2" ry="2" />
+<text  x="620.77" y="191.5" ></text>
+</g>
+<g >
+<title>std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;::basic_string (1 samples, 0.30%)</title><rect x="905.7" y="261" width="3.5" height="15.0" fill="rgb(221,121,23)" rx="2" ry="2" />
+<text  x="908.66" y="271.5" ></text>
+</g>
+<g >
+<title>std::uniform_real_distribution&lt;double&gt;::operator (1 samples, 0.30%)</title><rect x="941.2" y="213" width="3.6" height="15.0" fill="rgb(212,9,1)" rx="2" ry="2" />
+<text  x="944.20" y="223.5" ></text>
+</g>
+<g >
+<title>std::uniform_real_distribution&lt;double&gt;::operator (1 samples, 0.30%)</title><rect x="941.2" y="197" width="3.6" height="15.0" fill="rgb(214,82,24)" rx="2" ry="2" />
+<text  x="944.20" y="207.5" ></text>
+</g>
+<g >
+<title>ycsbc::CoreWorkload::BuildKeyName[abi:cxx11] (5 samples, 1.51%)</title><rect x="923.4" y="277" width="17.8" height="15.0" fill="rgb(215,30,38)" rx="2" ry="2" />
+<text  x="926.43" y="287.5" ></text>
+</g>
+<g >
+<title>operation_add_typed_entry (3 samples, 0.90%)</title><rect x="1165.1" y="581" width="10.7" height="15.0" fill="rgb(216,47,32)" rx="2" ry="2" />
+<text  x="1168.12" y="591.5" ></text>
+</g>
+<g >
+<title>std::function&lt;void  (1 samples, 0.30%)</title><rect x="891.4" y="229" width="3.6" height="15.0" fill="rgb(245,36,29)" rx="2" ry="2" />
+<text  x="894.45" y="239.5" ></text>
+</g>
+<g >
+<title>pmem::obj::persistent_ptr&lt;scythedb::InternalNode&gt;::operator (4 samples, 1.20%)</title><rect x="525.4" y="213" width="14.2" height="15.0" fill="rgb(212,61,11)" rx="2" ry="2" />
+<text  x="528.36" y="223.5" ></text>
+</g>
+<g >
+<title>std::call_once&lt;void  (215 samples, 64.76%)</title><rect x="191.3" y="517" width="764.1" height="15.0" fill="rgb(243,154,50)" rx="2" ry="2" />
+<text  x="194.27" y="527.5" >std::call_once&lt;void </text>
+</g>
+<g >
+<title>std::__uninitialized_copy_a&lt;std::move_iterator&lt;std::pair&lt;std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;, std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt; &gt;*&gt;, std::pair&lt;std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;, std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt; &gt;*, std::pair&lt;std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;, std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt; &gt; &gt; (1 samples, 0.30%)</title><rect x="482.7" y="245" width="3.6" height="15.0" fill="rgb(212,155,25)" rx="2" ry="2" />
+<text  x="485.71" y="255.5" ></text>
+</g>
+<g >
+<title>vfprintf (1 samples, 0.30%)</title><rect x="123.7" y="533" width="3.6" height="15.0" fill="rgb(248,79,45)" rx="2" ry="2" />
+<text  x="126.73" y="543.5" ></text>
+</g>
+<g >
+<title>std::_Destroy_aux&lt;false&gt;::__destroy&lt;std::pair&lt;std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;, std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt; &gt;*&gt; (1 samples, 0.30%)</title><rect x="909.2" y="245" width="3.6" height="15.0" fill="rgb(223,132,30)" rx="2" ry="2" />
+<text  x="912.22" y="255.5" ></text>
+</g>
+<g >
+<title>std::pointer_traits&lt;char*&gt;::pointer_to (1 samples, 0.30%)</title><rect x="493.4" y="261" width="3.5" height="15.0" fill="rgb(209,125,3)" rx="2" ry="2" />
+<text  x="496.37" y="271.5" ></text>
+</g>
+<g >
+<title>std::_Function_handler&lt;void  (2 samples, 0.60%)</title><rect x="223.3" y="85" width="7.1" height="15.0" fill="rgb(241,24,5)" rx="2" ry="2" />
+<text  x="226.25" y="95.5" ></text>
+</g>
+<g >
+<title>std::_Function_handler&lt;void  (1 samples, 0.30%)</title><rect x="887.9" y="165" width="3.5" height="15.0" fill="rgb(216,23,26)" rx="2" ry="2" />
+<text  x="890.89" y="175.5" ></text>
+</g>
+<g >
+<title>std::uniform_real_distribution&lt;double&gt;::operator (1 samples, 0.30%)</title><rect x="951.9" y="245" width="3.5" height="15.0" fill="rgb(229,35,38)" rx="2" ry="2" />
+<text  x="954.87" y="255.5" ></text>
+</g>
+<g >
+<title>std::_Function_base::_Base_manager&lt;scythedb::NVMSkipList::Insert (1 samples, 0.30%)</title><rect x="678.2" y="181" width="3.5" height="15.0" fill="rgb(250,141,7)" rx="2" ry="2" />
+<text  x="681.19" y="191.5" ></text>
+</g>
+<g >
+<title>_IO_vsnprintf (1 samples, 0.30%)</title><rect x="123.7" y="549" width="3.6" height="15.0" fill="rgb(218,222,50)" rx="2" ry="2" />
+<text  x="126.73" y="559.5" ></text>
+</g>
+<g >
+<title>scythedb::GetVarint32Ptr (17 samples, 5.12%)</title><rect x="329.9" y="133" width="60.4" height="15.0" fill="rgb(246,5,39)" rx="2" ry="2" />
+<text  x="332.88" y="143.5" >scythe..</text>
+</g>
+<g >
+<title>std::_Destroy&lt;std::pair&lt;std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;, std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt; &gt;*&gt; (1 samples, 0.30%)</title><rect x="909.2" y="261" width="3.6" height="15.0" fill="rgb(229,49,17)" rx="2" ry="2" />
+<text  x="912.22" y="271.5" ></text>
+</g>
+<g >
+<title>std::allocator_traits&lt;std::allocator&lt;char&gt; &gt;::deallocate (1 samples, 0.30%)</title><rect x="930.5" y="213" width="3.6" height="15.0" fill="rgb(233,2,33)" rx="2" ry="2" />
+<text  x="933.54" y="223.5" ></text>
+</g>
+<g >
+<title>std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;::_M_set_length (1 samples, 0.30%)</title><rect x="475.6" y="261" width="3.6" height="15.0" fill="rgb(250,181,7)" rx="2" ry="2" />
+<text  x="478.60" y="271.5" ></text>
+</g>
+<g >
+<title>scythedb::PutVarint32 (1 samples, 0.30%)</title><rect x="895.0" y="261" width="3.6" height="15.0" fill="rgb(246,76,52)" rx="2" ry="2" />
+<text  x="898.00" y="271.5" ></text>
+</g>
+<g >
+<title>scythedb::NVMArena::AllocateFallback (1 samples, 0.30%)</title><rect x="887.9" y="133" width="3.5" height="15.0" fill="rgb(214,83,21)" rx="2" ry="2" />
+<text  x="890.89" y="143.5" ></text>
+</g>
+<g >
+<title>scythedb::GetVarint32Ptr (1 samples, 0.30%)</title><rect x="841.7" y="133" width="3.5" height="15.0" fill="rgb(219,87,3)" rx="2" ry="2" />
+<text  x="844.69" y="143.5" ></text>
+</g>
+<g >
+<title>std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;::_M_dispose (2 samples, 0.60%)</title><rect x="461.4" y="293" width="7.1" height="15.0" fill="rgb(224,134,10)" rx="2" ry="2" />
+<text  x="464.39" y="303.5" ></text>
+</g>
+<g >
+<title>std::_Any_data::_M_access&lt;scythedb::NVMBlock::NVMBlock (1 samples, 0.30%)</title><rect x="422.3" y="181" width="3.5" height="15.0" fill="rgb(241,181,49)" rx="2" ry="2" />
+<text  x="425.29" y="191.5" ></text>
+</g>
+<g >
+<title>std::function&lt;void  (5 samples, 1.51%)</title><rect x="656.9" y="213" width="17.7" height="15.0" fill="rgb(235,79,46)" rx="2" ry="2" />
+<text  x="659.87" y="223.5" ></text>
+</g>
+<g >
+<title>pmem::obj::persistent_ptr&lt;scythedb::NVMMeta&gt;::get (1 samples, 0.30%)</title><rect x="205.5" y="229" width="3.5" height="15.0" fill="rgb(214,74,5)" rx="2" ry="2" />
+<text  x="208.48" y="239.5" ></text>
+</g>
+<g >
+<title>ycsbc::Client::TransactionRead (41 samples, 12.35%)</title><rect x="496.9" y="309" width="145.8" height="15.0" fill="rgb(253,97,23)" rx="2" ry="2" />
+<text  x="499.93" y="319.5" >ycsbc::Client::Tra..</text>
+</g>
+<g >
+<title>scythedb::NVMSkipList::KeyIsAfterNode (1 samples, 0.30%)</title><rect x="880.8" y="229" width="3.5" height="15.0" fill="rgb(231,194,43)" rx="2" ry="2" />
+<text  x="883.78" y="239.5" ></text>
+</g>
+<g >
+<title>scythedb::NVMSkipList::Node::Next (1 samples, 0.30%)</title><rect x="585.8" y="245" width="3.5" height="15.0" fill="rgb(223,102,1)" rx="2" ry="2" />
+<text  x="588.78" y="255.5" ></text>
+</g>
+<g >
+<title>scythedb::NVMSkipList::Node::PersistentKey (8 samples, 2.41%)</title><rect x="511.1" y="229" width="28.5" height="15.0" fill="rgb(244,123,23)" rx="2" ry="2" />
+<text  x="514.14" y="239.5" >sc..</text>
+</g>
+<g >
+<title>pmem::obj::persistent_ptr_base::operator= (1 samples, 0.30%)</title><rect x="216.1" y="165" width="3.6" height="15.0" fill="rgb(237,111,7)" rx="2" ry="2" />
+<text  x="219.14" y="175.5" ></text>
+</g>
+<g >
+<title>std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;::capacity (1 samples, 0.30%)</title><rect x="898.6" y="213" width="3.5" height="15.0" fill="rgb(234,129,19)" rx="2" ry="2" />
+<text  x="901.55" y="223.5" ></text>
+</g>
+<g >
+<title>scythedb::NVMArena::AllocateFallback (4 samples, 1.20%)</title><rect x="219.7" y="181" width="14.2" height="15.0" fill="rgb(246,166,32)" rx="2" ry="2" />
+<text  x="222.70" y="191.5" ></text>
+</g>
+<g >
+<title>pmemobj_tx_xadd_range_direct (1 samples, 0.30%)</title><rect x="667.5" y="101" width="3.6" height="15.0" fill="rgb(231,195,8)" rx="2" ry="2" />
+<text  x="670.53" y="111.5" ></text>
+</g>
+<g >
+<title>scythedb::InternalKeyComparator::Compare (8 samples, 2.41%)</title><rect x="393.9" y="149" width="28.4" height="15.0" fill="rgb(243,204,49)" rx="2" ry="2" />
+<text  x="396.86" y="159.5" >sc..</text>
+</g>
+<g >
+<title>std::__uninitialized_move_if_noexcept_a&lt;std::pair&lt;std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;, std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt; &gt;*, std::pair&lt;std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;, std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt; &gt;*, std::allocator&lt;std::pair&lt;std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;, std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt; &gt; &gt; &gt; (2 samples, 0.60%)</title><rect x="479.2" y="261" width="7.1" height="15.0" fill="rgb(235,87,4)" rx="2" ry="2" />
+<text  x="482.16" y="271.5" ></text>
+</g>
+<g >
+<title>pmemobj_tx_stage (1 samples, 0.30%)</title><rect x="226.8" y="53" width="3.6" height="15.0" fill="rgb(245,124,46)" rx="2" ry="2" />
+<text  x="229.81" y="63.5" ></text>
+</g>
+<g >
+<title>std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;::append (1 samples, 0.30%)</title><rect x="895.0" y="245" width="3.6" height="15.0" fill="rgb(252,11,36)" rx="2" ry="2" />
+<text  x="898.00" y="255.5" ></text>
+</g>
+<g >
+<title>scythedb::Arena::AllocateAligned (1 samples, 0.30%)</title><rect x="884.3" y="213" width="3.6" height="15.0" fill="rgb(230,222,8)" rx="2" ry="2" />
+<text  x="887.34" y="223.5" ></text>
+</g>
+<g >
+<title>cfree@GLIBC_2.2.5 (1 samples, 0.30%)</title><rect x="1097.6" y="549" width="3.5" height="15.0" fill="rgb(221,95,2)" rx="2" ry="2" />
+<text  x="1100.59" y="559.5" ></text>
+</g>
+<g >
+<title>std::_Function_handler&lt;int  (31 samples, 9.34%)</title><rect x="315.7" y="197" width="110.1" height="15.0" fill="rgb(210,30,50)" rx="2" ry="2" />
+<text  x="318.66" y="207.5" >std::_Functio..</text>
+</g>
+<g >
+<title>std::__invoke&lt;void  (215 samples, 64.76%)</title><rect x="191.3" y="501" width="764.1" height="15.0" fill="rgb(232,178,25)" rx="2" ry="2" />
+<text  x="194.27" y="511.5" >std::__invoke&lt;void </text>
+</g>
+<g >
+<title>std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;::append (2 samples, 0.60%)</title><rect x="624.9" y="261" width="7.1" height="15.0" fill="rgb(212,56,35)" rx="2" ry="2" />
+<text  x="627.88" y="271.5" ></text>
+</g>
+<g >
+<title>ycsbc::ZipfianGenerator::Next (1 samples, 0.30%)</title><rect x="941.2" y="245" width="3.6" height="15.0" fill="rgb(218,217,21)" rx="2" ry="2" />
+<text  x="944.20" y="255.5" ></text>
+</g>
+<g >
+<title>__random (2 samples, 0.60%)</title><rect x="468.5" y="293" width="7.1" height="15.0" fill="rgb(215,45,54)" rx="2" ry="2" />
+<text  x="471.49" y="303.5" ></text>
+</g>
+<g >
+<title>std::pair&lt;std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;, std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt; &gt;::~pair (1 samples, 0.30%)</title><rect x="617.8" y="213" width="3.5" height="15.0" fill="rgb(205,187,44)" rx="2" ry="2" />
+<text  x="620.77" y="223.5" ></text>
+</g>
+<g >
+<title>alloc_class_by_alloc_size (1 samples, 0.30%)</title><rect x="1136.7" y="581" width="3.5" height="15.0" fill="rgb(243,105,17)" rx="2" ry="2" />
+<text  x="1139.69" y="591.5" ></text>
+</g>
+<g >
+<title>std::_Destroy&lt;std::pair&lt;std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;, std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt; &gt; &gt; (1 samples, 0.30%)</title><rect x="909.2" y="229" width="3.6" height="15.0" fill="rgb(247,95,43)" rx="2" ry="2" />
+<text  x="912.22" y="239.5" ></text>
+</g>
+<g >
+<title>std::uniform_real_distribution&lt;double&gt;::operator (1 samples, 0.30%)</title><rect x="951.9" y="261" width="3.5" height="15.0" fill="rgb(237,37,20)" rx="2" ry="2" />
+<text  x="954.87" y="271.5" ></text>
+</g>
+<g >
+<title>std::min&lt;unsigned long&gt; (1 samples, 0.30%)</title><rect x="223.3" y="37" width="3.5" height="15.0" fill="rgb(222,170,13)" rx="2" ry="2" />
+<text  x="226.25" y="47.5" ></text>
+</g>
+<g >
+<title>_IO_default_xsputn (1 samples, 0.30%)</title><rect x="1115.4" y="581" width="3.5" height="15.0" fill="rgb(225,126,16)" rx="2" ry="2" />
+<text  x="1118.36" y="591.5" ></text>
+</g>
+<g >
+<title>std::make_pair&lt;std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt; const&amp;, std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;&amp;&gt; (1 samples, 0.30%)</title><rect x="610.7" y="293" width="3.5" height="15.0" fill="rgb(236,217,28)" rx="2" ry="2" />
+<text  x="613.66" y="303.5" ></text>
+</g>
+<g >
+<title>std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;::~basic_string (1 samples, 0.30%)</title><rect x="909.2" y="197" width="3.6" height="15.0" fill="rgb(212,20,36)" rx="2" ry="2" />
+<text  x="912.22" y="207.5" ></text>
+</g>
+<g >
+<title>std::_Destroy&lt;std::pair&lt;std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;, std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt; &gt;*, std::pair&lt;std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;, std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt; &gt; &gt; (1 samples, 0.30%)</title><rect x="617.8" y="277" width="3.5" height="15.0" fill="rgb(222,216,17)" rx="2" ry="2" />
+<text  x="620.77" y="287.5" ></text>
+</g>
+<g >
+<title>utils::RandomDouble (1 samples, 0.30%)</title><rect x="941.2" y="229" width="3.6" height="15.0" fill="rgb(216,193,23)" rx="2" ry="2" />
+<text  x="944.20" y="239.5" ></text>
+</g>
+<g >
+<title>std::_Function_base::_Base_manager&lt;scythedb::NVMBlock::NVMBlock (1 samples, 0.30%)</title><rect x="582.2" y="197" width="3.6" height="15.0" fill="rgb(222,61,7)" rx="2" ry="2" />
+<text  x="585.23" y="207.5" ></text>
+</g>
+<g >
+<title>__memmove_avx_unaligned_erms (4 samples, 1.20%)</title><rect x="592.9" y="213" width="14.2" height="15.0" fill="rgb(235,18,54)" rx="2" ry="2" />
+<text  x="595.89" y="223.5" ></text>
+</g>
+<g >
+<title>pmem::obj::p&lt;unsigned long&gt;::get_rw (1 samples, 0.30%)</title><rect x="667.5" y="117" width="3.6" height="15.0" fill="rgb(244,99,19)" rx="2" ry="2" />
+<text  x="670.53" y="127.5" ></text>
+</g>
+<g >
+<title>ycsbc::CoreWorkload::NextSequenceKey[abi:cxx11] (1 samples, 0.30%)</title><rect x="489.8" y="309" width="3.6" height="15.0" fill="rgb(254,71,15)" rx="2" ry="2" />
+<text  x="492.82" y="319.5" ></text>
+</g>
+<g >
+<title>std::function&lt;int  (21 samples, 6.33%)</title><rect x="799.0" y="197" width="74.7" height="15.0" fill="rgb(216,130,21)" rx="2" ry="2" />
+<text  x="802.04" y="207.5" >std::fun..</text>
+</g>
+<g >
+<title>pmemobj_direct_inline (1 samples, 0.30%)</title><rect x="724.4" y="165" width="3.6" height="15.0" fill="rgb(216,20,21)" rx="2" ry="2" />
+<text  x="727.40" y="175.5" ></text>
+</g>
+<g >
+<title>scythedb::(anonymous namespace)::BytewiseComparatorImpl::Compare (1 samples, 0.30%)</title><rect x="546.7" y="165" width="3.5" height="15.0" fill="rgb(231,84,26)" rx="2" ry="2" />
+<text  x="549.69" y="175.5" ></text>
+</g>
+<g >
+<title>all (332 samples, 100%)</title><rect x="10.0" y="613" width="1180.0" height="15.0" fill="rgb(217,198,26)" rx="2" ry="2" />
+<text  x="13.00" y="623.5" ></text>
+</g>
+<g >
+<title>pmem::obj::persistent_ptr&lt;scythedb::InternalNode&gt;::operator (1 samples, 0.30%)</title><rect x="258.8" y="213" width="3.5" height="15.0" fill="rgb(223,156,18)" rx="2" ry="2" />
+<text  x="261.80" y="223.5" ></text>
+</g>
+<g >
+<title>scythedb::NVMSkipList::KeyIsAfterNode (51 samples, 15.36%)</title><rect x="248.1" y="229" width="181.3" height="15.0" fill="rgb(253,224,40)" rx="2" ry="2" />
+<text  x="251.13" y="239.5" >scythedb::NVMSkipList::..</text>
+</g>
+<g >
+<title>pmem::obj::persistent_ptr&lt;scythedb::NVMMeta&gt;::operator (1 samples, 0.30%)</title><rect x="205.5" y="245" width="3.5" height="15.0" fill="rgb(254,179,47)" rx="2" ry="2" />
+<text  x="208.48" y="255.5" ></text>
+</g>
+<g >
+<title>ycsbc::DiscreteGenerator&lt;ycsbc::Operation&gt;::Next (3 samples, 0.90%)</title><rect x="944.8" y="293" width="10.6" height="15.0" fill="rgb(238,221,52)" rx="2" ry="2" />
+<text  x="947.76" y="303.5" ></text>
+</g>
+<g >
+<title>std::__detail::_Adaptor&lt;std::linear_congruential_engine&lt;unsigned long, 16807ul, 0ul, 2147483647ul&gt;, double&gt;::operator (1 samples, 0.30%)</title><rect x="951.9" y="229" width="3.5" height="15.0" fill="rgb(220,191,34)" rx="2" ry="2" />
+<text  x="954.87" y="239.5" ></text>
+</g>
+<g >
+<title>scythedb::NVMSkipList::Node::PersistentKey (1 samples, 0.30%)</title><rect x="589.3" y="245" width="3.6" height="15.0" fill="rgb(222,161,49)" rx="2" ry="2" />
+<text  x="592.34" y="255.5" ></text>
+</g>
+<g >
+<title>ycsbc::Client::TransactionUpdate (85 samples, 25.60%)</title><rect x="642.7" y="309" width="302.1" height="15.0" fill="rgb(241,51,24)" rx="2" ry="2" />
+<text  x="645.65" y="319.5" >ycsbc::Client::TransactionUpdate</text>
+</g>
+<g >
+<title>tx_range_def_cmp (1 samples, 0.30%)</title><rect x="1101.1" y="565" width="3.6" height="15.0" fill="rgb(213,146,1)" rx="2" ry="2" />
+<text  x="1104.14" y="575.5" ></text>
+</g>
+<g >
+<title>std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;::_M_replace (4 samples, 1.20%)</title><rect x="592.9" y="261" width="14.2" height="15.0" fill="rgb(216,198,46)" rx="2" ry="2" />
+<text  x="595.89" y="271.5" ></text>
+</g>
+<g >
+<title>pmemobj_direct_inline (1 samples, 0.30%)</title><rect x="233.9" y="133" width="3.6" height="15.0" fill="rgb(210,193,16)" rx="2" ry="2" />
+<text  x="236.92" y="143.5" ></text>
+</g>
+<g >
+<title>ycsbc::Client::DoInsert (85 samples, 25.60%)</title><rect x="194.8" y="325" width="302.1" height="15.0" fill="rgb(225,39,11)" rx="2" ry="2" />
+<text  x="197.82" y="335.5" >ycsbc::Client::DoInsert</text>
+</g>
+<g >
+<title>std::_Function_handler&lt;std::unique_ptr&lt;std::__future_base::_Result_base, std::__future_base::_Result_base::_Deleter&gt;  (215 samples, 64.76%)</title><rect x="191.3" y="437" width="764.1" height="15.0" fill="rgb(239,200,7)" rx="2" ry="2" />
+<text  x="194.27" y="447.5" >std::_Function_handler&lt;std::unique_ptr&lt;std::__future_base::_Result_base, std::__future_base::_Result_base..</text>
+</g>
+<g >
+<title>nvm_block_bench (332 samples, 100.00%)</title><rect x="10.0" y="597" width="1180.0" height="15.0" fill="rgb(213,195,12)" rx="2" ry="2" />
+<text  x="13.00" y="607.5" >nvm_block_bench</text>
+</g>
+<g >
+<title>scythedb::NVMSkipList::FindGreaterOrEqual (27 samples, 8.13%)</title><rect x="496.9" y="261" width="96.0" height="15.0" fill="rgb(217,26,7)" rx="2" ry="2" />
+<text  x="499.93" y="271.5" >scythedb::N..</text>
+</g>
+<g >
+<title>scythedb::NVMBlock::NVMBlock (17 samples, 5.12%)</title><rect x="806.1" y="165" width="60.5" height="15.0" fill="rgb(223,29,38)" rx="2" ry="2" />
+<text  x="809.14" y="175.5" >scythe..</text>
+</g>
+<g >
+<title>[unknown] (311 samples, 93.67%)</title><rect x="10.0" y="581" width="1105.4" height="15.0" fill="rgb(252,54,31)" rx="2" ry="2" />
+<text  x="13.00" y="591.5" >[unknown]</text>
+</g>
+<g >
+<title>lane_release (4 samples, 1.20%)</title><rect x="959.0" y="565" width="14.2" height="15.0" fill="rgb(250,228,43)" rx="2" ry="2" />
+<text  x="961.98" y="575.5" ></text>
+</g>
+<g >
+<title>std::allocator_traits&lt;std::allocator&lt;char&gt; &gt;::max_size (1 samples, 0.30%)</title><rect x="902.1" y="213" width="3.6" height="15.0" fill="rgb(245,215,52)" rx="2" ry="2" />
+<text  x="905.11" y="223.5" ></text>
+</g>
+<g >
+<title>std::__make_move_if_noexcept_iterator&lt;std::pair&lt;std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;, std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt; &gt;, std::move_iterator&lt;std::pair&lt;std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;, std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt; &gt;*&gt; &gt; (1 samples, 0.30%)</title><rect x="614.2" y="229" width="3.6" height="15.0" fill="rgb(210,26,46)" rx="2" ry="2" />
+<text  x="617.22" y="239.5" ></text>
+</g>
+<g >
+<title>std::allocator_traits&lt;std::allocator&lt;std::pair&lt;std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;, std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt; &gt; &gt; &gt;::construct&lt;std::pair&lt;std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;, std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt; &gt;, std::pair&lt;std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;, std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt; &gt; const&amp;&gt; (1 samples, 0.30%)</title><rect x="486.3" y="261" width="3.5" height="15.0" fill="rgb(248,75,14)" rx="2" ry="2" />
+<text  x="489.27" y="271.5" ></text>
+</g>
+<g >
+<title>std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;::basic_string (1 samples, 0.30%)</title><rect x="475.6" y="277" width="3.6" height="15.0" fill="rgb(251,20,26)" rx="2" ry="2" />
+<text  x="478.60" y="287.5" ></text>
+</g>
+<g >
+<title>pmem::obj::vector&lt;std::pair&lt;pmem::obj::persistent_ptr&lt;char&gt;, unsigned long&gt; &gt;::emplace_back&lt;std::pair&lt;pmem::obj::persistent_ptr&lt;char&gt;, unsigned long&gt; &gt; (3 samples, 0.90%)</title><rect x="223.3" y="133" width="10.6" height="15.0" fill="rgb(241,202,16)" rx="2" ry="2" />
+<text  x="226.25" y="143.5" ></text>
+</g>
+<g >
+<title>std::function&lt;void  (1 samples, 0.30%)</title><rect x="671.1" y="101" width="3.5" height="15.0" fill="rgb(222,84,31)" rx="2" ry="2" />
+<text  x="674.08" y="111.5" ></text>
+</g>
+<g >
+<title>std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;::_M_local_data (1 samples, 0.30%)</title><rect x="905.7" y="245" width="3.5" height="15.0" fill="rgb(212,101,37)" rx="2" ry="2" />
+<text  x="908.66" y="255.5" ></text>
+</g>
+<g >
+<title>scythedb::GetLengthPrefixedSlice (21 samples, 6.33%)</title><rect x="319.2" y="149" width="74.7" height="15.0" fill="rgb(230,75,19)" rx="2" ry="2" />
+<text  x="322.22" y="159.5" >scythedb..</text>
+</g>
+<g >
+<title>std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;::_M_append (1 samples, 0.30%)</title><rect x="457.8" y="261" width="3.6" height="15.0" fill="rgb(227,93,39)" rx="2" ry="2" />
+<text  x="460.83" y="271.5" ></text>
+</g>
+<g >
+<title>std::__future_base::_Task_setter&lt;std::unique_ptr&lt;std::__future_base::_Result&lt;int&gt;, std::__future_base::_Result_base::_Deleter&gt;, std::thread::_Invoker&lt;std::tuple&lt;int  (215 samples, 64.76%)</title><rect x="191.3" y="421" width="764.1" height="15.0" fill="rgb(213,120,21)" rx="2" ry="2" />
+<text  x="194.27" y="431.5" >std::__future_base::_Task_setter&lt;std::unique_ptr&lt;std::__future_base::_Result&lt;int&gt;, std::__future_base::_R..</text>
+</g>
+<g >
+<title>utils::RandomDouble (1 samples, 0.30%)</title><rect x="951.9" y="277" width="3.5" height="15.0" fill="rgb(210,167,7)" rx="2" ry="2" />
+<text  x="954.87" y="287.5" ></text>
+</g>
+<g >
+<title>scythedb::NVMBlock::KeyComparator::Compare (30 samples, 9.04%)</title><rect x="315.7" y="165" width="106.6" height="15.0" fill="rgb(213,221,41)" rx="2" ry="2" />
+<text  x="318.66" y="175.5" >scythedb::NVM..</text>
+</g>
+<g >
+<title>pmem::obj::persistent_ptr&lt;char&gt;::get (1 samples, 0.30%)</title><rect x="724.4" y="181" width="3.6" height="15.0" fill="rgb(215,149,32)" rx="2" ry="2" />
+<text  x="727.40" y="191.5" ></text>
+</g>
+<g >
+<title>pmemobj_direct_inline (1 samples, 0.30%)</title><rect x="887.9" y="37" width="3.5" height="15.0" fill="rgb(215,127,32)" rx="2" ry="2" />
+<text  x="890.89" y="47.5" ></text>
+</g>
+<g >
+<title>std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;::_M_construct_aux&lt;char*&gt; (1 samples, 0.30%)</title><rect x="610.7" y="229" width="3.5" height="15.0" fill="rgb(221,103,26)" rx="2" ry="2" />
+<text  x="613.66" y="239.5" ></text>
+</g>
+<g >
+<title>pmem::obj::persistent_ptr_base::persistent_ptr_base (8 samples, 2.41%)</title><rect x="262.3" y="181" width="28.5" height="15.0" fill="rgb(232,136,19)" rx="2" ry="2" />
+<text  x="265.35" y="191.5" >pm..</text>
+</g>
+<g >
+<title>std::vector&lt;std::pair&lt;std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;, std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt; &gt;, std::allocator&lt;std::pair&lt;std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;, std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt; &gt; &gt; &gt;::emplace_back&lt;std::pair&lt;std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;, std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt; &gt; &gt; (1 samples, 0.30%)</title><rect x="614.2" y="277" width="3.6" height="15.0" fill="rgb(209,7,42)" rx="2" ry="2" />
+<text  x="617.22" y="287.5" ></text>
+</g>
+<g >
+<title>std::function&lt;std::unique_ptr&lt;std::__future_base::_Result_base, std::__future_base::_Result_base::_Deleter&gt;  (215 samples, 64.76%)</title><rect x="191.3" y="453" width="764.1" height="15.0" fill="rgb(227,179,29)" rx="2" ry="2" />
+<text  x="194.27" y="463.5" >std::function&lt;std::unique_ptr&lt;std::__future_base::_Result_base, std::__future_base::_Result_base::_Delete..</text>
+</g>
+<g >
+<title>std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;::_M_destroy (1 samples, 0.30%)</title><rect x="461.4" y="277" width="3.5" height="15.0" fill="rgb(228,157,12)" rx="2" ry="2" />
+<text  x="464.39" y="287.5" ></text>
+</g>
+</g>
+</svg>
